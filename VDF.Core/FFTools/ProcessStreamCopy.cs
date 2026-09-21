@@ -20,27 +20,31 @@ namespace VDF.Core.FFTools {
 			TimeSpan timeout,
 			Action terminateProcess) {
 			using var cancellation = new CancellationTokenSource();
-			int timedOut = 0;
-			using CancellationTokenRegistration registration = cancellation.Token.Register(() => {
-				if (Interlocked.Exchange(ref timedOut, 1) != 0)
-					return;
+			Task copy = source.CopyToAsync(destination, cancellation.Token);
+			using WaitHandle completed = ((IAsyncResult)copy).AsyncWaitHandle;
+
+			// CancellationTokenSource.CancelAfter dispatches its timer through the thread
+			// pool. Under a saturated comparison/test workload that callback can arrive
+			// seconds late, leaving the process pipe blocked beyond its deadline. A wait
+			// handle enforces the deadline independently of thread-pool availability.
+			if (!completed.WaitOne(timeout)) {
 				try { terminateProcess(); } catch { }
-			});
-			cancellation.CancelAfter(timeout);
+				cancellation.Cancel();
+				// Some platform streams finish asynchronously after the child is killed.
+				// Observe a later fault without extending the caller's deadline.
+				_ = copy.ContinueWith(
+					static task => _ = task.Exception,
+					CancellationToken.None,
+					TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+					TaskScheduler.Default);
+				return false;
+			}
 
 			try {
-				source.CopyToAsync(destination, cancellation.Token).GetAwaiter().GetResult();
-				return Volatile.Read(ref timedOut) == 0;
+				copy.GetAwaiter().GetResult();
+				return true;
 			}
-			catch (OperationCanceledException) when (Volatile.Read(ref timedOut) != 0) {
-				return false;
-			}
-			catch (Exception) when (Volatile.Read(ref timedOut) != 0) {
-				// Killing the child closes its redirected pipe. Depending on the
-				// platform, the pending read completes as cancellation, EPIPE or
-				// an object-disposed exception.
-				return false;
-			}
+			finally { cancellation.Cancel(); }
 		}
 	}
 }

@@ -32,6 +32,11 @@ jobs:
           file: VDF.Web/Dockerfile
           platforms: linux/amd64
           push: true
+          # TCR expects a runnable Docker image manifest. Buildx provenance/SBOM
+          # attestations wrap even a single-platform build in an OCI image index,
+          # which TCR displays as OCI-Image-List-v1 instead of an image.
+          provenance: false
+          sbom: false
           tags: |
             ccr.ccs.tencentyun.com/xarchive/vdf-web:latest
             ccr.ccs.tencentyun.com/xarchive/vdf-web:${{ github.ref_name }}

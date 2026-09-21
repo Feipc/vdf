@@ -5,6 +5,14 @@ on:
   push:
     branches: [master]
 
+# Release artifacts are intentionally built after merge because they must be
+# produced from the actual master commit. If several merges land close together,
+# only the newest run is useful; cancel superseded runs instead of rebuilding and
+# replacing the same rolling 4.1.x assets repeatedly.
+concurrency:
+  group: rolling-release-master
+  cancel-in-progress: true
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
@@ -141,5 +149,4 @@ jobs:
             Last build based on ${{ steps.vars.outputs.sha_short }}
       env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
 
