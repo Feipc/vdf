@@ -85,6 +85,7 @@ namespace VDF.Core.ViewModels {
 			}
 			var fi = new FileInfo(Path);
 			DateCreated = file.DateCreated;
+			DateModified = file.DateModified;
 			SizeLong = fi.Exists ? fi.Length : -1;
 			if (file.IsImage)
 				Format = fi.Extension[1..];
@@ -117,6 +118,13 @@ namespace VDF.Core.ViewModels {
 		public bool IsBestSize { get; set; }
 		public string Size => SizeLong.BytesToString();
 		public float Similarity { get; set; }
+		/// <summary>
+		/// Path of the file this item's similarity score was measured against.
+		/// Null for legacy results and designated group references.
+		/// </summary>
+		public string? SimilarityReferencePath { get; set; }
+		/// <summary>True when this item is the baseline of a partial-clip group.</summary>
+		public bool IsSimilarityReference { get; set; }
 		public string Folder { get; set; }
 		public TimeSpan Duration { get; set; }
 		public bool IsBestDuration { get; set; }
@@ -165,6 +173,9 @@ namespace VDF.Core.ViewModels {
 		public bool IsBestFps { get; set; }
 		[JsonInclude]
 		public DateTime DateCreated { get; set; }
+		/// <summary>UTC modification time captured by the scan; null for legacy results.</summary>
+		[JsonInclude]
+		public DateTime? DateModified { get; set; }
 		[JsonInclude]
 		public DuplicateFlags Flags { get; set; }
 

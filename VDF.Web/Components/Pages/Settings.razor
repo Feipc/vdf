@@ -154,6 +154,95 @@
 </section>
 
 <section class="settings-section">
+    <h2>Performance Workers</h2>
+    <p class="setting-hint">
+        Stage values: 0 inherits the global value, -1 uses all @Environment.ProcessorCount container-visible CPUs.
+    </p>
+    <label>
+        Metadata / FFprobe workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.MetadataMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.MetadataMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.MetadataMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Frame Hash workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.FrameHashMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.FrameHashMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.FrameHashMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Audio Hash workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.AudioHashMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.AudioHashMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.AudioHashMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Gray visual comparison workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.VisualCompareMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.VisualCompareMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.VisualCompareMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        pHash comparison workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.PHashCompareMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.PHashCompareMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.PHashCompareMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Partial index/search workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.PartialIndexMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.PartialIndexMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.PartialIndexMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Partial exact comparison workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.PartialExactMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.PartialExactMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.PartialExactMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Partial visual source/clip workers
+        <input type="number" min="1" max="16"
+               value="@Scan.Settings.PartialClipVisualMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.PartialClipVisualMaxDegreeOfParallelism = Math.Clamp(ParseInt(e.Value), 1, 16)" />
+        <span class="setting-hint">Effective: @Math.Min(16, Scan.Settings.PartialClipVisualMaxDegreeOfParallelism)</span>
+    </label>
+    <label>
+        Thumbnail workers
+        <input type="number" min="-1" max="256"
+               value="@Scan.Settings.ThumbnailMaxDegreeOfParallelism"
+               @onchange="e => Scan.Settings.ThumbnailMaxDegreeOfParallelism = ParseStageWorkers(e.Value)" />
+        <span class="setting-hint">Effective: @ResolvedWorkers(Scan.Settings.ThumbnailMaxDegreeOfParallelism)</span>
+    </label>
+    <div class="start-row" style="margin-top:0.75rem;">
+        <button type="button" @onclick="ImportSavedWorkerProfile">Load benchmark profile from server</button>
+        <label style="margin:0;">
+            Import worker-profile.json
+            <InputFile OnChange="ImportWorkerProfile" accept=".json,application/json" />
+        </label>
+        <a class="button" href="/export/worker-profile" download="worker-profile.json">Export current profile</a>
+    </div>
+    @if (_workerProfileMessage != null) {
+        <p class="@(_workerProfileError ? "aborted-msg" : "done-msg")">@_workerProfileMessage</p>
+    }
+    @if (_importedWorkerProfile != null) {
+        <p class="setting-hint">
+            Imported @_importedWorkerProfile.Preset profile created
+            @_importedWorkerProfile.CreatedUtc.ToLocalTime().ToString("g");
+            benchmark CPUs: @_importedWorkerProfile.VisibleCpuCount,
+            current CPUs: @Environment.ProcessorCount.
+        </p>
+    }
+</section>
+
+<section class="settings-section">
     <h2>File Filters</h2>
     <label>
         <input type="checkbox"
@@ -213,6 +302,10 @@
                @onchange="e => Scan.Settings.UseNativeFfmpegBinding = (bool)e.Value!" />
         Use native FFmpeg binding
     </label>
+    <p class="setting-hint">
+        Native shared libraries: @(VDF.Core.ScanEngine.NativeFFmpegCanLoad ? "loadable" : "not loadable; external FFmpeg will be used").
+        Native mode remains disabled by default.
+    </p>
     <label>
         Hardware acceleration
         <select @onchange="e => Scan.Settings.HardwareAccelerationMode = Enum.Parse<VDF.Core.FFTools.FFHardwareAccelerationMode>(e.Value!.ToString()!)">
@@ -239,6 +332,34 @@
     </label>
     @if (Scan.Settings.EnablePartialClipDetection) {
         <label>
+            Candidate search mode
+            <select @onchange="e => Scan.Settings.PartialClipSearchMode = Enum.Parse<VDF.Core.PartialClipSearchMode>(e.Value!.ToString()!)">
+                <option value="@VDF.Core.PartialClipSearchMode.FastBalanced"
+                        selected="@(Scan.Settings.PartialClipSearchMode == VDF.Core.PartialClipSearchMode.FastBalanced)">
+                    Fast Balanced (approximate, high recall)
+                </option>
+                <option value="@VDF.Core.PartialClipSearchMode.Exact"
+                        selected="@(Scan.Settings.PartialClipSearchMode == VDF.Core.PartialClipSearchMode.Exact)">
+                    Exact (no candidate loss)
+                </option>
+            </select>
+        </label>
+        @if (Scan.Settings.PartialClipSearchMode == VDF.Core.PartialClipSearchMode.FastBalanced) {
+            <label>
+                Maximum source candidates per clip
+                <input type="number" min="1" max="4096" step="1"
+                       value="@Scan.Settings.PartialClipMaxCandidates"
+                       @onchange="e => Scan.Settings.PartialClipMaxCandidates = Math.Clamp(ParseInt(e.Value), 1, 4096)" />
+            </label>
+            <label>
+                Index memory limit (MiB)
+                <input type="number" min="128" max="32768" step="128"
+                       value="@Scan.Settings.PartialClipIndexMemoryLimitMB"
+                       @onchange="e => Scan.Settings.PartialClipIndexMemoryLimitMB = Math.Clamp(ParseInt(e.Value), 128, 32768)" />
+            </label>
+            <p class="setting-hint">Fast Balanced can miss matches during candidate search. Exact verification and visual confirmation still prevent additional false positives.</p>
+        }
+        <label>
             Min clip / source ratio %
             <input type="number" min="1" max="100" step="0.1"
                    value="@((Scan.Settings.PartialClipMinRatio * 100).ToString(CultureInfo.InvariantCulture))"
@@ -263,6 +384,7 @@
                        value="@((Scan.Settings.PartialClipVisualThreshold * 100).ToString(CultureInfo.InvariantCulture))"
                        @onchange="e => Scan.Settings.PartialClipVisualThreshold = ParseDouble(e.Value) / 100.0" />
             </label>
+            <p class="setting-hint">Default: 6. A higher value can be slower on HDD arrays because it increases random seeks.</p>
         }
     }
 </section>
@@ -387,6 +509,9 @@
     string _testFileB = string.Empty;
     bool _testBusy;
     string? _testResult;
+    string? _workerProfileMessage;
+    bool _workerProfileError;
+    WorkerProfile? _importedWorkerProfile;
 
     async Task RunFilePairTest() {
         _testBusy = true;
@@ -408,6 +533,53 @@
             _saveMsg = null;
             StateHasChanged();
         }));
+    }
+
+    async Task ImportWorkerProfile(InputFileChangeEventArgs args) {
+        _workerProfileMessage = null;
+        _workerProfileError = false;
+        try {
+            await using Stream stream = args.File.OpenReadStream(10 * 1024 * 1024);
+            using var memory = new MemoryStream();
+            await stream.CopyToAsync(memory);
+            memory.Position = 0;
+            if (WebSettingsService.TryImportWorkerProfile(
+                Scan.Settings,
+                memory,
+                out WorkerProfile? profile,
+                out string? error)) {
+                _importedWorkerProfile = profile;
+                _workerProfileMessage = profile!.VisibleCpuCount == Environment.ProcessorCount
+                    ? "Worker profile applied. Save settings to keep it."
+                    : $"Worker profile applied, but it was measured with {profile.VisibleCpuCount} CPUs and this container sees {Environment.ProcessorCount}.";
+            }
+            else {
+                _workerProfileError = true;
+                _workerProfileMessage = error;
+            }
+        }
+        catch (Exception ex) {
+            _workerProfileError = true;
+            _workerProfileMessage = $"Import failed: {ex.Message}";
+        }
+    }
+
+    void ImportSavedWorkerProfile() {
+        _workerProfileMessage = null;
+        _workerProfileError = false;
+        if (WebSettingsService.TryImportSavedWorkerProfile(
+            Scan.Settings,
+            out WorkerProfile? profile,
+            out string? error)) {
+            _importedWorkerProfile = profile;
+            _workerProfileMessage = profile!.VisibleCpuCount == Environment.ProcessorCount
+                ? "Benchmark profile applied. Save settings to keep it."
+                : $"Benchmark profile applied, but it was measured with {profile.VisibleCpuCount} CPUs and this container sees {Environment.ProcessorCount}.";
+        }
+        else {
+            _workerProfileError = true;
+            _workerProfileMessage = error;
+        }
     }
 
     async Task CleanDatabase() {
@@ -467,6 +639,19 @@
 
     static int ParseInt(object? v) =>
         int.TryParse(Normalize(v).Split('.')[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var r) ? r : 0;
+
+    static int ParseStageWorkers(object? value) {
+        int parsed = ParseInt(value);
+        return parsed == -1 || parsed is >= 0 and <= WorkerParallelism.MaximumConfiguredWorkers
+            ? parsed
+            : 0;
+    }
+
+    int ResolvedWorkers(int stageValue) =>
+        WorkerParallelism.Resolve(
+            stageValue,
+            Scan.Settings.MaxDegreeOfParallelism,
+            Environment.ProcessorCount);
 
     static byte ParseByte(object? v) =>
         byte.TryParse(Normalize(v).Split('.')[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var r) ? r : (byte)0;

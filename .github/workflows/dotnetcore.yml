@@ -21,6 +21,8 @@ jobs:
       run: dotnet publish VDF.Web/VDF.Web.csproj -c Release -v q --self-contained -r win-x64
     - name: Run Unit Tests
       run: dotnet test VDF.Core.Tests/VDF.Core.Tests.csproj -c Release -v q
+    - name: Run Web Tests
+      run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q
     - name: Run CLI Tests
       run: dotnet test VDF.CLI.Tests/VDF.CLI.Tests.csproj -c Release -v q
     - name: Install FFmpeg

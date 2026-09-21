@@ -105,6 +105,15 @@ namespace VDF.CLI.Commands {
 			DefaultValueFactory = _ => 0.85
 		};
 
+		internal static readonly Option<int> PartialClipVisualParallelism = new("--partial-clip-visual-parallelism") {
+			Description = "Maximum decoder workers for partial-clip visual confirmation (1-16). Default: 6.",
+			DefaultValueFactory = _ => 6
+		};
+
+		internal static readonly Option<string?> PartialClipSearchMode = new("--partial-clip-search-mode") {
+			Description = "Partial-clip candidate search mode: fast (default) or exact."
+		};
+
 		internal static readonly Option<int> CheckpointInterval = new("--checkpoint-interval") {
 			Description = "Database checkpoint interval in minutes during scanning. 0 = disabled. Default: 5.",
 			DefaultValueFactory = _ => 5
@@ -159,6 +168,22 @@ namespace VDF.CLI.Commands {
 			s.PartialClipSimilarityThreshold = r.GetValue(PartialClipSimilarityThreshold);
 			s.PartialClipRequireVisualMatch = r.GetValue(PartialClipRequireVisualMatch);
 			s.PartialClipVisualThreshold = r.GetValue(PartialClipVisualThreshold);
+			int visualParallelism = r.GetValue(PartialClipVisualParallelism);
+			s.PartialClipVisualMaxDegreeOfParallelism = Math.Clamp(
+				visualParallelism <= 0
+					? 6
+					: visualParallelism,
+				1,
+				16);
+			string? partialSearchMode = r.GetValue(PartialClipSearchMode);
+			if (partialSearchMode != null) {
+				s.PartialClipSearchMode = partialSearchMode.ToLowerInvariant() switch {
+					"fast" or "fastbalanced" or "fast-balanced" => VDF.Core.PartialClipSearchMode.FastBalanced,
+					"exact" => VDF.Core.PartialClipSearchMode.Exact,
+					_ => throw new ArgumentException(
+						$"Invalid --partial-clip-search-mode '{partialSearchMode}'. Use 'fast' or 'exact'."),
+				};
+			}
 		}
 
 		internal static void AddScanOptions(Command cmd) {
@@ -181,6 +206,8 @@ namespace VDF.CLI.Commands {
 			cmd.Options.Add(PartialClipSimilarityThreshold);
 			cmd.Options.Add(PartialClipRequireVisualMatch);
 			cmd.Options.Add(PartialClipVisualThreshold);
+			cmd.Options.Add(PartialClipVisualParallelism);
+			cmd.Options.Add(PartialClipSearchMode);
 			cmd.Options.Add(SettingsFile);
 			cmd.Options.Add(Format);
 			cmd.Options.Add(Output);

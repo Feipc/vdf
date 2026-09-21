@@ -28,6 +28,7 @@ namespace VDF.Core.Utils {
 	[JsonSerializable(typeof(Dictionary<string, string>))]
 	[JsonSerializable(typeof(DatabaseWrapper))]
 	[JsonSerializable(typeof(Settings))]
+	[JsonSerializable(typeof(WorkerProfile))]
 	[JsonSerializable(typeof(BlacklistStore.Envelope))]
 	[JsonSerializable(typeof(List<HashSet<string>>))]
 	public partial class CoreJsonContext : JsonSerializerContext { }

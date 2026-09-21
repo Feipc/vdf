@@ -37,6 +37,7 @@ namespace VDF.Core {
 		public HashSet<DuplicateItem> Duplicates { get; set; } = new HashSet<DuplicateItem>();
 		public Settings Settings { get; set; } = new Settings();
 		public event EventHandler<ScanProgressChangedEventArgs>? Progress;
+		public event EventHandler<ComparisonProgressChangedEventArgs>? ComparisonProgress;
 		public event EventHandler? BuildingHashesDone;
 		public event EventHandler? ScanDone;
 		public event EventHandler? ScanAborted;
@@ -57,7 +58,7 @@ namespace VDF.Core {
 		readonly Stopwatch SearchTimer = new();
 		public Stopwatch ElapsedTimer = new();
 		int processedFiles;
-		DateTime startTime = DateTime.Now;
+		readonly ScanEtaEstimator scanEtaEstimator = new();
 		DateTime lastProgressUpdate = DateTime.MinValue;
 		static readonly TimeSpan progressUpdateIntervall = TimeSpan.FromMilliseconds(300);
 		const int maxExcludedLogsPerReason = 5;
@@ -70,14 +71,51 @@ namespace VDF.Core {
 			CoreUtils.IsWindows ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
 		DateTime lastCheckpointTime = DateTime.MinValue;
 		readonly object checkpointLock = new();
+		readonly Stopwatch comparisonStageTimer = new();
+		long comparisonProgressCurrent;
+		long comparisonProgressTotal;
+		double comparisonWorkCurrent;
+		double comparisonWorkTotal;
+		long lastComparisonProgressTimestamp;
+		int comparisonActiveWorkers;
+		int comparisonEffectiveParallelism;
+		ComparisonStage comparisonStage;
+
+		int EffectiveParallelism => ParallelismUtils.Resolve(Settings.MaxDegreeOfParallelism);
+		int MetadataParallelism => WorkerParallelism.Resolve(
+			Settings.MetadataMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int FrameHashParallelism => WorkerParallelism.Resolve(
+			Settings.FrameHashMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int AudioHashParallelism => WorkerParallelism.Resolve(
+			Settings.AudioHashMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int VisualComparisonParallelism => WorkerParallelism.Resolve(
+			Settings.UsePHashing
+				? Settings.PHashCompareMaxDegreeOfParallelism
+				: Settings.VisualCompareMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int PartialIndexParallelism => WorkerParallelism.Resolve(
+			Settings.PartialIndexMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int PartialExactParallelism => WorkerParallelism.Resolve(
+			Settings.PartialExactMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int ThumbnailParallelism => WorkerParallelism.Resolve(
+			Settings.ThumbnailMaxDegreeOfParallelism,
+			Settings.MaxDegreeOfParallelism);
+		int InitialScanParallelism => Math.Max(
+			MetadataParallelism,
+			Math.Max(FrameHashParallelism, AudioHashParallelism));
 
 		string T(string key, params object[] args) =>
 			LanguageService.Instance.Get(Settings.LanguageCode, key, args);
 
 		void InitProgress(int count) {
-			startTime = DateTime.UtcNow;
 			scanProgressMaxValue = count;
 			processedFiles = 0;
+			scanEtaEstimator.Reset(count, DateTime.UtcNow);
 			lastProgressUpdate = DateTime.MinValue;
 			lastCheckpointTime = DateTime.UtcNow;
 		}
@@ -108,16 +146,16 @@ namespace VDF.Core {
 			}
 		}
 		void IncrementProgress(string path) {
-			processedFiles++;
-			var pushUpdate = processedFiles == scanProgressMaxValue ||
-								lastProgressUpdate + progressUpdateIntervall < DateTime.UtcNow;
+			int current = Interlocked.Increment(ref processedFiles);
+			DateTime now = DateTime.UtcNow;
+			var pushUpdate = current == scanProgressMaxValue ||
+								lastProgressUpdate + progressUpdateIntervall < now;
 			if (!pushUpdate) return;
-			lastProgressUpdate = DateTime.UtcNow;
-			var timeRemaining = TimeSpan.FromTicks(DateTime.UtcNow.Subtract(startTime).Ticks *
-									(scanProgressMaxValue - (processedFiles + 1)) / (processedFiles + 1));
+			lastProgressUpdate = now;
+			TimeSpan timeRemaining = scanEtaEstimator.Estimate(current, now);
 			Progress?.Invoke(this,
 							new ScanProgressChangedEventArgs {
-								CurrentPosition = processedFiles,
+								CurrentPosition = current,
 								CurrentFile = path,
 								Elapsed = ElapsedTimer.Elapsed,
 								Remaining = timeRemaining,
@@ -131,13 +169,14 @@ namespace VDF.Core {
 		// Throttled to the same cadence as IncrementProgress so a stuck file's last-reported
 		// stage (e.g. "sampling frame 2/5") hints at where it froze.
 		void ReportStage(string path, string stage, int stageCurrent = 0, int stageMax = 0) {
-			if (lastProgressUpdate + progressUpdateIntervall > DateTime.UtcNow) return;
-			lastProgressUpdate = DateTime.UtcNow;
-			var timeRemaining = TimeSpan.FromTicks(DateTime.UtcNow.Subtract(startTime).Ticks *
-									(scanProgressMaxValue - (processedFiles + 1)) / (processedFiles + 1));
+			DateTime now = DateTime.UtcNow;
+			if (lastProgressUpdate + progressUpdateIntervall > now) return;
+			lastProgressUpdate = now;
+			int current = Volatile.Read(ref processedFiles);
+			TimeSpan timeRemaining = scanEtaEstimator.Estimate(current, now);
 			Progress?.Invoke(this,
 							new ScanProgressChangedEventArgs {
-								CurrentPosition = processedFiles,
+								CurrentPosition = current,
 								CurrentFile = path,
 								Elapsed = ElapsedTimer.Elapsed,
 								Remaining = timeRemaining,
@@ -146,6 +185,22 @@ namespace VDF.Core {
 								StageCurrent = stageCurrent,
 								StageMax = stageMax,
 							});
+		}
+
+		void ReportHashDatabaseSave() {
+			DateTime now = DateTime.UtcNow;
+			int current = Math.Max(0, scanProgressMaxValue);
+			Interlocked.Exchange(ref processedFiles, current);
+			lastProgressUpdate = now;
+			Progress?.Invoke(this,
+				new ScanProgressChangedEventArgs {
+					CurrentPosition = current,
+					MaxPosition = scanProgressMaxValue,
+					Elapsed = ElapsedTimer.Elapsed,
+					Remaining = TimeSpan.Zero,
+					CurrentFile = string.Empty,
+					CurrentStage = "Saving scan database...",
+				});
 		}
 
 		void TryDatabaseCheckpoint() {
@@ -161,9 +216,120 @@ namespace VDF.Core {
 			}
 		}
 
+		void LogComparisonParallelism() {
+			int configured = Settings.MaxDegreeOfParallelism;
+			int visibleProcessors = Environment.ProcessorCount;
+			int effective = EffectiveParallelism;
+			Logger.Instance.Info(
+				$"Comparison parallelism: configured={configured}, container-visible CPUs={visibleProcessors}, effective workers={effective}");
+			Logger.Instance.Info(
+				$"Stage workers: visual/pHash={VisualComparisonParallelism}, " +
+				$"partial index/search={PartialIndexParallelism}, " +
+				$"partial exact={PartialExactParallelism}, " +
+				$"partial visual={Math.Min(16, WorkerParallelism.Resolve(Settings.PartialClipVisualMaxDegreeOfParallelism, configured))}, " +
+				$"thumbnails={ThumbnailParallelism}.");
+			if (configured != -1 && configured <= 0)
+				Logger.Instance.Info($"Invalid parallelism value {configured}; falling back to one worker.");
+			if (configured == -1 && visibleProcessors <= 1)
+				Logger.Instance.Info(
+					"All-core comparison requested, but the process can see only one CPU. Check the Docker/ESXi CPU quota.");
+		}
+
+		void BeginComparisonStage(
+			ComparisonStage stage,
+			long total,
+			double? estimatedWork = null,
+			int? effectiveParallelism = null) {
+			comparisonStage = stage;
+			Interlocked.Exchange(ref comparisonProgressCurrent, 0);
+			Interlocked.Exchange(ref comparisonProgressTotal, Math.Max(0, total));
+			Interlocked.Exchange(ref comparisonWorkCurrent, 0);
+			Interlocked.Exchange(ref comparisonWorkTotal, Math.Max(0, estimatedWork ?? total));
+			Interlocked.Exchange(ref comparisonActiveWorkers, 0);
+			Interlocked.Exchange(
+				ref comparisonEffectiveParallelism,
+				Math.Max(1, effectiveParallelism ?? EffectiveParallelism));
+			comparisonStageTimer.Restart();
+			Interlocked.Exchange(ref lastComparisonProgressTimestamp, Stopwatch.GetTimestamp());
+			RaiseComparisonProgress(force: true);
+		}
+
+		void AddComparisonProgress(long completed, double? completedWork = null) {
+			if (completed <= 0) return;
+			Interlocked.Add(ref comparisonProgressCurrent, completed);
+			AtomicAdd(ref comparisonWorkCurrent, Math.Max(0, completedWork ?? completed));
+			RaiseComparisonProgress(force: false);
+		}
+
+		void CompleteComparisonStage() {
+			long total = Interlocked.Read(ref comparisonProgressTotal);
+			Interlocked.Exchange(ref comparisonProgressCurrent, total);
+			Interlocked.Exchange(ref comparisonWorkCurrent, Volatile.Read(ref comparisonWorkTotal));
+			comparisonStageTimer.Stop();
+			RaiseComparisonProgress(force: true);
+		}
+
+		void StopComparisonStage() {
+			comparisonStageTimer.Stop();
+			RaiseComparisonProgress(force: true);
+		}
+
+		void RaiseComparisonProgress(bool force) {
+			if (ComparisonProgress == null) return;
+
+			long now = Stopwatch.GetTimestamp();
+			if (!force) {
+				long previous = Volatile.Read(ref lastComparisonProgressTimestamp);
+				if (now - previous < Stopwatch.Frequency / 3)
+					return;
+				if (Interlocked.CompareExchange(ref lastComparisonProgressTimestamp, now, previous) != previous)
+					return;
+			}
+			else {
+				Interlocked.Exchange(ref lastComparisonProgressTimestamp, now);
+			}
+
+			long current = Interlocked.Read(ref comparisonProgressCurrent);
+			long total = Interlocked.Read(ref comparisonProgressTotal);
+			double completedWork = Volatile.Read(ref comparisonWorkCurrent);
+			double totalWork = Volatile.Read(ref comparisonWorkTotal);
+			TimeSpan elapsed = comparisonStageTimer.Elapsed;
+			double rate = elapsed.TotalSeconds > 0 ? current / elapsed.TotalSeconds : 0;
+			TimeSpan remaining = TimeSpan.Zero;
+			double workRate = elapsed.TotalSeconds > 0 ? completedWork / elapsed.TotalSeconds : 0;
+			if (workRate > 0 && totalWork > completedWork) {
+				double remainingSeconds = (totalWork - completedWork) / workRate;
+				remaining = remainingSeconds >= TimeSpan.MaxValue.TotalSeconds
+					? TimeSpan.MaxValue
+					: TimeSpan.FromSeconds(remainingSeconds);
+			}
+
+			ComparisonProgress?.Invoke(this, new ComparisonProgressChangedEventArgs {
+				Stage = comparisonStage,
+				Current = current,
+				Total = total,
+				ItemsPerSecond = rate,
+				Elapsed = elapsed,
+				Remaining = remaining,
+				ActiveWorkers = Volatile.Read(ref comparisonActiveWorkers),
+				EffectiveParallelism = Volatile.Read(ref comparisonEffectiveParallelism),
+			});
+		}
+
+		static void AtomicAdd(ref double location, double value) {
+			double current;
+			double updated;
+			do {
+				current = Volatile.Read(ref location);
+				updated = current + value;
+			}
+			while (Interlocked.CompareExchange(ref location, updated, current) != current);
+		}
+
 		public static bool FFmpegExists => !string.IsNullOrEmpty(FfmpegEngine.FFmpegPath);
 		public static bool FFprobeExists => !string.IsNullOrEmpty(FFProbeEngine.FFprobePath);
 		public static bool NativeFFmpegExists => FFTools.FFmpegNative.FFmpegHelper.DoFFmpegLibraryFilesExist;
+		public static bool NativeFFmpegCanLoad => FFTools.FFmpegNative.FFmpegHelper.CanLoadNativeLibraries;
 
 		/// <param name="searchAndCompare">
 		/// When true (GUI/Web default) the search chains straight into <see cref="StartCompare"/>.
@@ -188,6 +354,7 @@ namespace VDF.Core {
 			// Save before signaling completion: consumers (e.g. the CLI) may treat the
 			// event as "done" and exit the process, which previously killed this thread
 			// mid-write and left a torn ScannedFiles_new.db behind.
+			ReportHashDatabaseSave();
 			DatabaseUtils.SaveDatabase();
 			BuildingHashesDone?.Invoke(this, new EventArgs());
 			if (!cancelationTokenSource.IsCancellationRequested) {
@@ -205,6 +372,7 @@ namespace VDF.Core {
 
 		public async void StartCompare() {
 			PrepareCompare();
+			LogComparisonParallelism();
 			SearchTimer.Start();
 			ElapsedTimer.Start();
 			Logger.Instance.Info(T("Log.ScanForDuplicates"));
@@ -217,9 +385,13 @@ namespace VDF.Core {
 			Logger.Instance.Info(T("Log.FinishedScanForDuplicates", SearchTimer.Elapsed));
 			LogGroupStatistics();
 			Logger.Instance.Info(T("Log.HighlightingBestResults"));
+			BeginComparisonStage(ComparisonStage.GroupingResults, 1);
 			HighlightBestMatches();
+			CompleteComparisonStage();
 			// Save before signaling completion — see the matching comment in StartSearch.
+			BeginComparisonStage(ComparisonStage.SavingDatabase, 1);
 			DatabaseUtils.SaveDatabase();
+			CompleteComparisonStage();
 			isScanning = false;
 			ScanDone?.Invoke(this, new EventArgs());
 			Logger.Instance.Info(T("Log.ScanDone"));
@@ -240,8 +412,7 @@ namespace VDF.Core {
 			FfmpegEngine.HardwareAccelerationMode = Settings.HardwareAccelerationMode;
 			FfmpegEngine.CustomFFArguments = Settings.CustomFFArguments;
 			FfmpegEngine.UseNativeBinding = Settings.UseNativeFfmpegBinding;
-			DatabaseUtils.CustomDatabaseFolder = Settings.CustomDatabaseFolder;
-			DatabaseUtils.InvalidateDatabaseFolder();
+			DatabaseUtils.ConfigureDatabaseFolder(Settings.CustomDatabaseFolder);
 			Duplicates.Clear();
 			positionList.Clear();
 			ElapsedTimer.Reset();
@@ -302,8 +473,7 @@ namespace VDF.Core {
 			if (DatabaseUtils.Database.Count == 0) {
 				// Also a compare-only concern: the database is normally loaded by
 				// StartSearch's BuildFileList, which never ran in this process (issue #790).
-				DatabaseUtils.CustomDatabaseFolder = Settings.CustomDatabaseFolder;
-				DatabaseUtils.InvalidateDatabaseFolder();
+				DatabaseUtils.ConfigureDatabaseFolder(Settings.CustomDatabaseFolder);
 				DatabaseUtils.LoadDatabase();
 				// The invalid flag is not persisted and defaults to true; it is normally
 				// cleared per entry by StartSearch's hashing pass. Without this pass a
@@ -494,7 +664,13 @@ namespace VDF.Core {
 		bool InvalidEntryForDuplicateCheck(FileEntry entry) =>
 			entry.invalid || entry.mediaInfo == null || entry.Flags.Has(EntryFlags.ThumbnailError) || (!entry.IsImage && entry.grayBytes.Count < Settings.ThumbnailCount);
 
+		public static void ConfigureDatabaseFolder(string? folder) =>
+			DatabaseUtils.ConfigureDatabaseFolder(folder);
+		public static string ConfiguredDatabaseFolder =>
+			DatabaseUtils.ConfiguredDatabaseFolder;
 		public static Task<bool> LoadDatabase() => Task.Run(DatabaseUtils.LoadDatabase);
+		public static Task<bool> CreateDatabaseBackup() =>
+			Task.Run(DatabaseUtils.CreateBackup);
 		public static void SaveDatabase() => DatabaseUtils.SaveDatabase();
 		public static void RemoveFromDatabase(FileEntry dbEntry) => DatabaseUtils.Database.Remove(dbEntry);
 		public static void UpdateFilePathInDatabase(string newPath, FileEntry dbEntry) => DatabaseUtils.UpdateFilePath(newPath, dbEntry);
@@ -537,7 +713,20 @@ namespace VDF.Core {
 		async Task GatherInfos() {
 			try {
 				InitProgress(DatabaseUtils.Database.Count);
-				await Parallel.ForEachAsync(DatabaseUtils.Database, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, (entry, token) => {
+				using var metadataGate = new SemaphoreSlim(MetadataParallelism);
+				using var frameHashGate = new SemaphoreSlim(FrameHashParallelism);
+				using var audioHashGate = new SemaphoreSlim(AudioHashParallelism);
+				Logger.Instance.Info(
+					$"Initial scan workers: metadata={MetadataParallelism}, " +
+					$"frame hash={FrameHashParallelism}, audio hash={AudioHashParallelism}, " +
+					$"pipeline={InitialScanParallelism}.");
+				await Parallel.ForEachAsync(
+					DatabaseUtils.Database,
+					new ParallelOptions {
+						CancellationToken = cancelationTokenSource.Token,
+						MaxDegreeOfParallelism = InitialScanParallelism,
+					},
+					async (entry, token) => {
 					pauseTokenSource.WaitWhilePaused(token);
 
 					try {
@@ -581,7 +770,7 @@ namespace VDF.Core {
 								LogExcludedFile(entry, skipReason);
 							if (reportProgress)
 								IncrementProgress(entry.Path);
-							return ValueTask.CompletedTask;
+							return;
 						}
 						if (Settings.IncludeNonExistingFiles && entry.grayBytes?.Count > 0) {
 							bool hasAllInformation = entry.IsImage;
@@ -605,22 +794,35 @@ namespace VDF.Core {
 									string cachedAudioPath = entry.Path;
 									string audioStageLabel = T("Scan.Stage.AudioFingerprint");
 									ReportStage(cachedAudioPath, audioStageLabel);
-									ExtractAudioFingerprint(entry, cancelationTokenSource.Token,
-										onProgress: p => ReportStage(cachedAudioPath, audioStageLabel, (int)(p * 100), 100));
+									await audioHashGate.WaitAsync(token);
+									try {
+										ExtractAudioFingerprint(entry, token,
+											onProgress: p => ReportStage(cachedAudioPath, audioStageLabel, (int)(p * 100), 100));
+									}
+									finally {
+										audioHashGate.Release();
+									}
 								}
 								IncrementProgress(entry.Path);
-								return ValueTask.CompletedTask;
+								return;
 							}
 						}
 
 						if (entry.mediaInfo == null && !entry.IsImage) {
 							ReportStage(entry.Path, T("Scan.Stage.Probing"));
-							MediaInfo? info = FFProbeEngine.GetMediaInfo(entry.Path, Settings.ExtendedFFToolsLogging);
+							await metadataGate.WaitAsync(token);
+							MediaInfo? info;
+							try {
+								info = FFProbeEngine.GetMediaInfo(entry.Path, Settings.ExtendedFFToolsLogging);
+							}
+							finally {
+								metadataGate.Release();
+							}
 							if (info == null) {
 								entry.invalid = true;
 								entry.Flags.Set(EntryFlags.MetadataError);
 								IncrementProgress(entry.Path);
-								return ValueTask.CompletedTask;
+								return;
 							}
 
 							entry.mediaInfo = info;
@@ -631,18 +833,24 @@ namespace VDF.Core {
 						entry.PHashes ??= new Dictionary<double, ulong?>();
 
 
-						if (entry.IsImage && entry.grayBytes.Count == 0) {
-							if (!GetGrayBytesFromImage(entry, Settings.UseExifCreationDate, Settings.ExtendedFFToolsLogging))
-								entry.invalid = true;
+						await frameHashGate.WaitAsync(token);
+						try {
+							if (entry.IsImage && entry.grayBytes.Count == 0) {
+								if (!GetGrayBytesFromImage(entry, Settings.UseExifCreationDate, Settings.ExtendedFFToolsLogging))
+									entry.invalid = true;
+							}
+							else if (!entry.IsImage) {
+								string entryPath = entry.Path;
+								int totalSamples = positionList.Count;
+								string samplingLabel = T("Scan.Stage.SamplingFrames");
+								if (!FfmpegEngine.GetGrayBytesFromVideo(entry, positionList, Settings.MaxSamplingDurationSeconds,
+										Settings.ExtendedFFToolsLogging,
+										onSampleComplete: (done) => ReportStage(entryPath, samplingLabel, done, totalSamples)))
+									entry.invalid = true;
+							}
 						}
-						else if (!entry.IsImage) {
-							string entryPath = entry.Path;
-							int totalSamples = positionList.Count;
-							string samplingLabel = T("Scan.Stage.SamplingFrames");
-							if (!FfmpegEngine.GetGrayBytesFromVideo(entry, positionList, Settings.MaxSamplingDurationSeconds,
-									Settings.ExtendedFFToolsLogging,
-									onSampleComplete: (done) => ReportStage(entryPath, samplingLabel, done, totalSamples)))
-								entry.invalid = true;
+						finally {
+							frameHashGate.Release();
 						}
 
 						// Audio fingerprint — videos only, only when enabled,
@@ -656,12 +864,18 @@ namespace VDF.Core {
 							string audioPath = entry.Path;
 							string audioLabel = T("Scan.Stage.AudioFingerprint");
 							ReportStage(audioPath, audioLabel);
-							ExtractAudioFingerprint(entry, cancelationTokenSource.Token,
-								onProgress: p => ReportStage(audioPath, audioLabel, (int)(p * 100), 100));
+							await audioHashGate.WaitAsync(token);
+							try {
+								ExtractAudioFingerprint(entry, token,
+									onProgress: p => ReportStage(audioPath, audioLabel, (int)(p * 100), 100));
+							}
+							finally {
+								audioHashGate.Release();
+							}
 						}
 
 						IncrementProgress(entry.Path);
-						return ValueTask.CompletedTask;
+						return;
 					}
 					catch (OperationCanceledException) {
 						throw;
@@ -674,7 +888,7 @@ namespace VDF.Core {
 						entry.invalid = true;
 						entry.Flags.Set(EntryFlags.ThumbnailError);
 						IncrementProgress(entry.Path);
-						return ValueTask.CompletedTask;
+						return;
 					}
 				});
 			}
@@ -897,7 +1111,10 @@ namespace VDF.Core {
 
 			Logger.Instance.Info($"Scanning for duplicates in {ScanList.Count:N0} files");
 
-			InitProgress(ScanList.Count);
+			BeginComparisonStage(
+				ComparisonStage.VisualComparison,
+				ScanList.Count,
+				effectiveParallelism: VisualComparisonParallelism);
 
 			// Duration buckets are keyed by whole seconds to keep percent-based tolerance intact.
 			const int bucketSizeSeconds = 1;
@@ -961,7 +1178,9 @@ namespace VDF.Core {
 							mergesBlocked++;
 							return;
 						}
-						var newItem = new DuplicateItem(compItem, difference, existingBase!.GroupId, flags);
+						var newItem = new DuplicateItem(compItem, difference, existingBase!.GroupId, flags) {
+							SimilarityReferencePath = entry.Path,
+						};
 						if (duplicateDict.TryAdd(compItem.Path, newItem))
 							groupMembers[existingBase.GroupId].Add(newItem);
 					}
@@ -972,14 +1191,20 @@ namespace VDF.Core {
 							mergesBlocked++;
 							return;
 						}
-						var newItem = new DuplicateItem(entry, difference, existingComp!.GroupId, flags);
+						var newItem = new DuplicateItem(entry, difference, existingComp!.GroupId, flags) {
+							SimilarityReferencePath = compItem.Path,
+						};
 						if (duplicateDict.TryAdd(entry.Path, newItem))
 							groupMembers[existingComp.GroupId].Add(newItem);
 					}
 					else {
 						var groupId = Guid.NewGuid();
-						var compDup = new DuplicateItem(compItem, difference, groupId, flags);
-						var entryDup = new DuplicateItem(entry, difference, groupId, DuplicateFlags.None);
+						var compDup = new DuplicateItem(compItem, difference, groupId, flags) {
+							SimilarityReferencePath = entry.Path,
+						};
+						var entryDup = new DuplicateItem(entry, difference, groupId, DuplicateFlags.None) {
+							SimilarityReferencePath = compItem.Path,
+						};
 						duplicateDict.TryAdd(compItem.Path, compDup);
 						duplicateDict.TryAdd(entry.Path, entryDup);
 						groupMembers[groupId] = new List<DuplicateItem> { compDup, entryDup };
@@ -1009,6 +1234,8 @@ namespace VDF.Core {
 			// Compare one entry against candidate buckets (bucketed path).
 			void CompareEntry(FileEntry entry, int entryIndex, IEnumerable<int> candidateBucketKeys) {
 				pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+				Interlocked.Increment(ref comparisonActiveWorkers);
+				try {
 
 				float difference = 0;
 				bool isDuplicate;
@@ -1062,12 +1289,18 @@ namespace VDF.Core {
 							MergeDuplicate(entry, compItem, difference, flags);
 					}
 				}
-				IncrementProgress(entry.Path);
+				}
+				finally {
+					AddComparisonProgress(1);
+					Interlocked.Decrement(ref comparisonActiveWorkers);
+				}
 			}
 
 			// Images are always compared linearly; bucketing is only applied to videos.
 			void CompareImages() {
 				Action<int> compareAction = i => {
+					Interlocked.Increment(ref comparisonActiveWorkers);
+					try {
 					var entry = imageEntries[i];
 					byte[]?[]? flippedGrayBytes = null;
 					if (Settings.CompareHorizontallyFlipped)
@@ -1095,12 +1328,16 @@ namespace VDF.Core {
 						if (isDuplicate)
 							MergeDuplicate(entry, compItem, difference, flags);
 					}
-					IncrementProgress(entry.Path);
+					}
+					finally {
+						AddComparisonProgress(1);
+						Interlocked.Decrement(ref comparisonActiveWorkers);
+					}
 				};
 
 				try {
 					if (imageEntries.Count >= largeBucketThreshold) {
-						Parallel.For(0, imageEntries.Count, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, compareAction);
+						Parallel.For(0, imageEntries.Count, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = VisualComparisonParallelism }, compareAction);
 					}
 					else {
 						for (int i = 0; i < imageEntries.Count; i++)
@@ -1114,6 +1351,8 @@ namespace VDF.Core {
 			void CompareVideosLinear() {
 				Action<int> compareAction = i => {
 					pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+					Interlocked.Increment(ref comparisonActiveWorkers);
+					try {
 
 					var entry = videoEntries[i];
 					float difference = 0;
@@ -1158,12 +1397,16 @@ namespace VDF.Core {
 							MergeDuplicate(entry, compItem, difference, flags);
 					}
 
-					IncrementProgress(entry.Path);
+					}
+					finally {
+						AddComparisonProgress(1);
+						Interlocked.Decrement(ref comparisonActiveWorkers);
+					}
 				};
 
 				try {
 					if (videoEntries.Count >= largeBucketThreshold) {
-						Parallel.For(0, videoEntries.Count, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, compareAction);
+						Parallel.For(0, videoEntries.Count, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = VisualComparisonParallelism }, compareAction);
 					}
 					else {
 						for (int i = 0; i < videoEntries.Count; i++)
@@ -1181,39 +1424,36 @@ namespace VDF.Core {
 					CompareVideosLinear();
 				}
 				else {
-					// Large dataset: use buckets to reduce candidate comparisons.
-					var smallBuckets = videoBuckets.Where(kvp => kvp.Value.Count < largeBucketThreshold).ToList();
-					var largeBuckets = videoBuckets.Where(kvp => kvp.Value.Count >= largeBucketThreshold).ToList();
-
-					Parallel.ForEach(smallBuckets, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, bucket => {
-						foreach (var entry in bucket.Value) {
-							int entryIndex = entry.compareIndex;
+					// Keep duration buckets as the candidate index, but expose every
+					// video as independently stealable work. Scheduling a whole bucket
+					// at once leaves one worker processing a dense tail while all other
+					// cores sit idle.
+					Parallel.ForEach(
+						VisualComparisonWorkPartitioner.Create(videoEntries.Count),
+						new ParallelOptions {
+							CancellationToken = cancelationTokenSource.Token,
+							MaxDegreeOfParallelism = VisualComparisonParallelism,
+						},
+						index => {
+							FileEntry entry = videoEntries[index];
 							double durationSeconds = entry.mediaInfo!.Duration.TotalSeconds;
 							double maxDiffSeconds = GetDurationToleranceSeconds(durationSeconds);
 							double minDuration = Math.Max(0d, durationSeconds - maxDiffSeconds);
 							double maxDuration = durationSeconds + maxDiffSeconds;
 							int minKey = (int)Math.Floor(minDuration / bucketSizeSeconds);
 							int maxKey = (int)Math.Floor(maxDuration / bucketSizeSeconds);
-							CompareEntry(entry, entryIndex, Enumerable.Range(minKey, maxKey - minKey + 1));
-						}
-					});
-
-					foreach (var bucket in largeBuckets) {
-						Parallel.For(0, bucket.Value.Count, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, i => {
-							var entry = bucket.Value[i];
-							int entryIndex = entry.compareIndex;
-							double durationSeconds = entry.mediaInfo!.Duration.TotalSeconds;
-							double maxDiffSeconds = GetDurationToleranceSeconds(durationSeconds);
-							double minDuration = Math.Max(0d, durationSeconds - maxDiffSeconds);
-							double maxDuration = durationSeconds + maxDiffSeconds;
-							int minKey = (int)Math.Floor(minDuration / bucketSizeSeconds);
-							int maxKey = (int)Math.Floor(maxDuration / bucketSizeSeconds);
-							CompareEntry(entry, entryIndex, Enumerable.Range(minKey, maxKey - minKey + 1));
+							CompareEntry(
+								entry,
+								entry.compareIndex,
+								Enumerable.Range(minKey, maxKey - minKey + 1));
 						});
-					}
 				}
 			}
 			catch (OperationCanceledException) { }
+			if (cancelationTokenSource.IsCancellationRequested)
+				StopComparisonStage();
+			else
+				CompleteComparisonStage();
 			if (mergesBlocked > 0)
 				Logger.Instance.Info($"Group merge validation: blocked {mergesBlocked} merge(s) where group representatives were not similar");
 			if (missingPHashFiles.Count > 0)
@@ -1235,8 +1475,10 @@ namespace VDF.Core {
 		/// using audio fingerprint sliding-window matching.  Results are added to Duplicates.
 		/// The comparison loop runs in parallel; grouping is applied sequentially afterward.
 		/// </summary>
-		void ScanForPartialDuplicates() {
-			Logger.Instance.Info("Partial clip detection: building fingerprint index...");
+		internal void ScanForPartialDuplicates() {
+			var partialTimer = Stopwatch.StartNew();
+			Logger.Instance.Info("Partial clip detection: planning exact candidate ranges...");
+			BeginComparisonStage(ComparisonStage.PartialCandidatePlanning, DatabaseUtils.Database.Count);
 
 			// Build a quick lookup for paths already covered by visual duplicate groups.
 			var alreadyGrouped = new HashSet<string>(
@@ -1252,94 +1494,235 @@ namespace VDF.Core {
 						!e.Flags.Has(EntryFlags.SilentAudioTrack) &&
 						e.AudioFingerprint != null && e.AudioFingerprint.Length >= 2 &&
 						!IsSilentFingerprint(e.AudioFingerprint) &&
-						!alreadyGrouped.Contains(e.Path))
+						!alreadyGrouped.Contains(e.Path) &&
+						(e.mediaInfo?.Duration ?? TimeSpan.Zero).TotalSeconds >= 1.0)
 				.OrderByDescending(e => e.mediaInfo?.Duration ?? TimeSpan.Zero)
 				.ToList();
 
 			if (videos.Count < 2) {
+				CompleteComparisonStage();
 				Logger.Instance.Info("Partial clip detection: fewer than 2 eligible videos, skipping.");
 				return;
 			}
 
-			Logger.Instance.Info($"Partial clip detection: comparing {videos.Count} video(s) (fingerprint blocks: min={videos.Min(e => e.AudioFingerprint!.Length)}, max={videos.Max(e => e.AudioFingerprint!.Length)})...");
+			var compareEntries = new PartialCompareEntry[videos.Count];
+			for (int i = 0; i < videos.Count; i++) {
+				FileEntry entry = videos[i];
+				compareEntries[i] = new PartialCompareEntry(
+					entry,
+					entry.mediaInfo!.Duration.TotalSeconds,
+					entry.AudioFingerprint!,
+					i);
+			}
+			PartialComparisonPlan plan = PartialComparisonPlanner.Create(
+				compareEntries,
+				Settings.PartialClipMinRatio);
+			CompleteComparisonStage();
+
+			Logger.Instance.Info(
+				$"Partial clip detection: {videos.Count:N0} video(s), " +
+				$"{plan.CandidatePairCount:N0} exact duration-eligible pair(s) " +
+				$"(fingerprint blocks: min={compareEntries.Min(e => e.Fingerprint.Length)}, max={compareEntries.Max(e => e.Fingerprint.Length)})...");
+
+			IEnumerable<PartialComparisonWorkBatch> workBatches;
+			long candidatePairCount;
+			double estimatedWork;
+			if (Settings.PartialClipSearchMode == PartialClipSearchMode.FastBalanced) {
+				long memoryLimitBytes = Settings.PartialClipIndexMemoryLimitMB <= 0
+					? 0
+					: (long)Settings.PartialClipIndexMemoryLimitMB * 1024L * 1024L;
+				BeginComparisonStage(
+					ComparisonStage.PartialIndexBuilding,
+					PartialClipFingerprintIndex.TableCount,
+					effectiveParallelism: PartialIndexParallelism);
+				PartialClipFingerprintIndex? fingerprintIndex;
+				PartialClipIndexBuildStats indexStats;
+				bool indexBuilt;
+				try {
+					indexBuilt = PartialClipFingerprintIndex.TryBuild(
+						compareEntries,
+						memoryLimitBytes,
+						cancelationTokenSource.Token,
+						out fingerprintIndex,
+						out indexStats,
+						() => AddComparisonProgress(1),
+						delta => Interlocked.Add(ref comparisonActiveWorkers, delta),
+						PartialIndexParallelism);
+				}
+				catch (OperationCanceledException) {
+					StopComparisonStage();
+					return;
+				}
+
+				if (!indexBuilt || fingerprintIndex == null) {
+					CompleteComparisonStage();
+					Logger.Instance.Info(
+						$"Partial clip detection: Fast Balanced index needs about " +
+						$"{indexStats.EstimatedBytes / (1024d * 1024d):N1} MiB, above the " +
+						$"{Math.Max(0, Settings.PartialClipIndexMemoryLimitMB):N0} MiB limit or allocation failed; " +
+						"falling back to Exact.");
+					workBatches = plan.Batches.Select(batch => new PartialComparisonWorkBatch(
+						batch.SourceIndex,
+						batch.StartClipIndex,
+						batch.EndClipIndex,
+						null));
+					candidatePairCount = plan.CandidatePairCount;
+					estimatedWork = plan.EstimatedWork;
+				}
+				else {
+					CompleteComparisonStage();
+					Logger.Instance.Info(
+						$"Partial clip detection: built 8-table index for {indexStats.FingerprintBlocks:N0} " +
+						$"fingerprint block(s), {indexStats.PostingCount:N0} posting(s), " +
+						$"{indexStats.EstimatedBytes / (1024d * 1024d):N1} MiB estimated peak, " +
+						$"{indexStats.HotBucketCount:N0} hot bucket(s).");
+
+					BeginComparisonStage(
+						ComparisonStage.PartialCandidateSearch,
+						compareEntries.Length,
+						effectiveParallelism: PartialIndexParallelism);
+					PartialIndexedComparisonPlan indexedPlan;
+					try {
+						indexedPlan = PartialIndexedComparisonPlanner.Create(
+							compareEntries,
+							fingerprintIndex,
+							Settings.PartialClipMinRatio,
+							Math.Max(1, Settings.PartialClipMaxCandidates),
+							PartialIndexParallelism,
+							cancelationTokenSource.Token,
+							() => AddComparisonProgress(1),
+							delta => Interlocked.Add(ref comparisonActiveWorkers, delta));
+						CompleteComparisonStage();
+					}
+					catch (OperationCanceledException) {
+						StopComparisonStage();
+						return;
+					}
+					fingerprintIndex = null;
+
+					workBatches = indexedPlan.Batches;
+					candidatePairCount = indexedPlan.CandidatePairCount;
+					estimatedWork = indexedPlan.EstimatedWork;
+					double reduction = plan.CandidatePairCount == 0
+						? 0
+						: 1.0 - (double)candidatePairCount / plan.CandidatePairCount;
+					Logger.Instance.Info(
+						$"Partial clip detection: Fast Balanced retained {candidatePairCount:N0} pair(s) " +
+						$"({reduction:P2} reduction from Exact), exact-fallback clips={indexedPlan.FallbackClipCount:N0}, " +
+						$"posting visits={indexedPlan.PostingVisits:N0}, max candidates/clip={Math.Max(1, Settings.PartialClipMaxCandidates):N0}.");
+				}
+			}
+			else {
+				workBatches = plan.Batches.Select(batch => new PartialComparisonWorkBatch(
+					batch.SourceIndex,
+					batch.StartClipIndex,
+					batch.EndClipIndex,
+					null));
+				candidatePairCount = plan.CandidatePairCount;
+				estimatedWork = plan.EstimatedWork;
+				Logger.Instance.Info("Partial clip detection: search mode Exact.");
+			}
 
 			float simThreshold = (float)Settings.PartialClipSimilarityThreshold;
 
 			// --- Parallel phase: compute all matches without mutating shared state ---
 			var matches = new ConcurrentBag<(int sourceIdx, int clipIdx, float sim, int offsetSec)>();
-			int pairsChecked = 0;
+			long pairsChecked = 0;
+			BeginComparisonStage(
+				ComparisonStage.PartialExactVerification,
+				candidatePairCount,
+				estimatedWork,
+				PartialExactParallelism);
+			try {
+				var partitioner = Partitioner.Create(
+					workBatches,
+					EnumerablePartitionerOptions.NoBuffering);
+				Parallel.ForEach(
+					partitioner,
+					new ParallelOptions {
+						CancellationToken = cancelationTokenSource.Token,
+						MaxDegreeOfParallelism = PartialExactParallelism,
+					},
+					batch => {
+						Interlocked.Increment(ref comparisonActiveWorkers);
+						long localProcessed = 0;
+						long localChecked = 0;
+						double localWork = 0;
+						try {
+							void ComparePair(int sourceIndex, int clipIndex) {
+								cancelationTokenSource.Token.ThrowIfCancellationRequested();
+								pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+								PartialCompareEntry source = compareEntries[sourceIndex];
+								PartialCompareEntry clip = compareEntries[clipIndex];
+								localProcessed++;
+								localWork += PartialComparisonPlanner.EstimateWork(source, clip);
 
-			Parallel.For(0, videos.Count - 1,
-				new ParallelOptions {
-					CancellationToken = cancelationTokenSource.Token,
-					MaxDegreeOfParallelism = Math.Max(1, Settings.MaxDegreeOfParallelism)
-				},
-				i => {
-					FileEntry source = videos[i];
-					double sourceSec = (source.mediaInfo?.Duration ?? TimeSpan.Zero).TotalSeconds;
-					if (sourceSec < 1.0) return;
+								if (clip.Fingerprint.Length >= source.Fingerprint.Length)
+									return;
 
-					for (int j = i + 1; j < videos.Count; j++) {
-						if (cancelationTokenSource.IsCancellationRequested) break;
-						FileEntry clip = videos[j];
-						double clipSec = (clip.mediaInfo?.Duration ?? TimeSpan.Zero).TotalSeconds;
-						if (clipSec < 1.0) continue;
+								localChecked++;
+								var (sim, offsetSec) = SlidingWindowCompare(
+									clip.Fingerprint,
+									source.Fingerprint,
+									simThreshold);
+								if (sim >= simThreshold)
+									matches.Add((sourceIndex, clipIndex, sim, offsetSec));
+							}
 
-						// Pre-filter 1: clip must be at least PartialClipMinRatio of source
-						if (clipSec / sourceSec < Settings.PartialClipMinRatio) continue;
-
-						// Pre-filter 2: clip must be shorter than 95% of source (visual dup handles the rest)
-						if (clipSec / sourceSec >= 0.95) continue;
-
-						// Fingerprint block sanity (each block ≈ 1 second)
-						uint[] fpSource = source.AudioFingerprint!;
-						uint[] fpClip = clip.AudioFingerprint!;
-						if (fpClip.Length >= fpSource.Length) continue;
-
-						Interlocked.Increment(ref pairsChecked);
-						var (sim, offsetSec) = SlidingWindowCompare(fpClip, fpSource, simThreshold);
-
-						if (sim >= simThreshold)
-							matches.Add((i, j, sim, offsetSec));
-					}
-				});
+							pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+							if (batch.SourceIndices == null) {
+								for (int clipIndex = batch.Start; clipIndex < batch.End; clipIndex++)
+									ComparePair(batch.PrimaryIndex, clipIndex);
+							}
+							else {
+								for (int position = batch.Start; position < batch.End; position++)
+									ComparePair(batch.SourceIndices[position], batch.PrimaryIndex);
+							}
+						}
+						finally {
+							Interlocked.Add(ref pairsChecked, localChecked);
+							AddComparisonProgress(localProcessed, localWork);
+							Interlocked.Decrement(ref comparisonActiveWorkers);
+						}
+					});
+				CompleteComparisonStage();
+			}
+			catch (OperationCanceledException) {
+				StopComparisonStage();
+				return;
+			}
 
 			// --- Sequential phase: build groups from matches (preserving longest-source-first order) ---
 			// A clip is kept with its first (longest) matching source. Sources whose only
 			// candidate clips are already claimed are skipped entirely - adding them would
 			// produce singleton groups in the result list.
+			BeginComparisonStage(ComparisonStage.GroupingResults, matches.Count);
 			var assignments = AssignPartialClipGroups(matches);
+			AddComparisonProgress(matches.Count);
+			CompleteComparisonStage();
 
 			// Optional visual gate: drop pairs that match audio but differ visually at the
 			// matched offset (e.g. videos sharing a backing track but otherwise unrelated).
 			// Uses pHash when Settings.UsePHashing is on, else 32x32 grayscale percentage diff.
 			if (Settings.PartialClipRequireVisualMatch && assignments.Count > 0) {
 				int beforeCount = assignments.Count;
-				int dropped = 0;
-				var verified = new ConcurrentBag<(int, int, float, int, Guid)>();
 				try {
-					Parallel.ForEach(assignments, new ParallelOptions {
-						CancellationToken = cancelationTokenSource.Token,
-						MaxDegreeOfParallelism = Math.Max(1, Settings.MaxDegreeOfParallelism)
-					}, a => {
-						bool pass = VerifyPartialClipVisually(videos[a.sourceIdx], videos[a.clipIdx], a.offsetSec, out float visualSim);
-						if (pass) {
-							verified.Add(a);
-						}
-						else {
-							Interlocked.Increment(ref dropped);
-							if (Settings.ExtendedFFToolsLogging)
-								Logger.Instance.Info($"[Partial] Visual gate dropped {System.IO.Path.GetFileName(videos[a.clipIdx].Path)} in {System.IO.Path.GetFileName(videos[a.sourceIdx].Path)}: visualSim={visualSim:P1} (threshold {Settings.PartialClipVisualThreshold:P0})");
-						}
-					});
+					assignments = VerifyPartialClipAssignmentsVisually(
+						videos,
+						assignments,
+						out int dropped);
+					Logger.Instance.Info(
+						$"Partial clip detection: visual gate kept {assignments.Count}/{beforeCount} " +
+						$"assignment(s), dropped {dropped}");
 				}
-				catch (OperationCanceledException) { }
-				assignments = verified.OrderBy(a => a.Item1).ThenBy(a => a.Item2).ToList();
-				Logger.Instance.Info($"Partial clip detection: visual gate kept {assignments.Count}/{beforeCount} assignment(s), dropped {dropped}");
+				catch (OperationCanceledException) {
+					StopComparisonStage();
+					return;
+				}
 			}
 
 			var addedSources = new HashSet<int>();
-
+			BeginComparisonStage(ComparisonStage.GroupingResults, assignments.Count);
 			foreach (var (si, ci, sim, offsetSec, groupId) in assignments) {
 				FileEntry source = videos[si];
 				FileEntry clip = videos[ci];
@@ -1348,14 +1731,202 @@ namespace VDF.Core {
 					Logger.Instance.Info($"[Partial] {System.IO.Path.GetFileName(clip.Path)} in {System.IO.Path.GetFileName(source.Path)}: sim={sim:P1} @ {offsetSec}s (threshold {Settings.PartialClipSimilarityThreshold:P0}, fp {clip.AudioFingerprint!.Length}/{source.AudioFingerprint!.Length} blocks)");
 
 				if (addedSources.Add(si))
-					Duplicates.Add(new DuplicateItem(source, 0f, groupId, DuplicateFlags.None));
+					Duplicates.Add(new DuplicateItem(source, 0f, groupId, DuplicateFlags.None) {
+						IsSimilarityReference = true,
+					});
 
 				Duplicates.Add(new DuplicateItem(clip, 1f - sim, groupId, DuplicateFlags.PartialClip) {
-					PartialClipOffset = TimeSpan.FromSeconds(offsetSec)
+					PartialClipOffset = TimeSpan.FromSeconds(offsetSec),
+					SimilarityReferencePath = source.Path,
 				});
+				AddComparisonProgress(1);
+			}
+			CompleteComparisonStage();
+
+			partialTimer.Stop();
+			Logger.Instance.Info(
+				$"Partial clip detection: checked {pairsChecked:N0} fingerprint pair(s), " +
+				$"found {matches.Count:N0} candidate match(es), formed {assignments.Count:N0} " +
+				$"clip-source assignment(s), elapsed {partialTimer.Elapsed}.");
+		}
+
+		List<(int sourceIdx, int clipIdx, float sim, int offsetSec, Guid groupId)>
+			VerifyPartialClipAssignmentsVisually(
+				IReadOnlyList<FileEntry> videos,
+				List<(int sourceIdx, int clipIdx, float sim, int offsetSec, Guid groupId)> assignments,
+				out int dropped) {
+			int workerCount = PartialVisualVerificationUtils.ResolveParallelism(
+				WorkerParallelism.Resolve(
+					Settings.PartialClipVisualMaxDegreeOfParallelism,
+					Settings.MaxDegreeOfParallelism),
+				Settings.PartialClipVisualMaxDegreeOfParallelism);
+			var visualTimer = Stopwatch.StartNew();
+			var extractionStats = new GrayFrameExtractionStats();
+			var clipTimesByAssignment = new double[assignments.Count][];
+			var sourceTimesByAssignment = new double[assignments.Count][];
+			var sourceFramesByAssignment = new IReadOnlyList<byte[]?>[assignments.Count];
+
+			for (int assignmentIndex = 0; assignmentIndex < assignments.Count; assignmentIndex++) {
+				var assignment = assignments[assignmentIndex];
+				FileEntry source = videos[assignment.sourceIdx];
+				FileEntry clip = videos[assignment.clipIdx];
+				double sourceSeconds = (source.mediaInfo?.Duration ?? TimeSpan.Zero).TotalSeconds;
+				double clipSeconds = (clip.mediaInfo?.Duration ?? TimeSpan.Zero).TotalSeconds;
+				if (sourceSeconds <= 0 || clipSeconds <= 0) {
+					clipTimesByAssignment[assignmentIndex] = Array.Empty<double>();
+					sourceTimesByAssignment[assignmentIndex] = Array.Empty<double>();
+					sourceFramesByAssignment[assignmentIndex] = Array.Empty<byte[]?>();
+					continue;
+				}
+
+				double[] requestedClipTimes = PartialVisualVerificationUtils.BuildClipTimes(clipSeconds);
+				var clipTimes = new List<double>(requestedClipTimes.Length);
+				var sourceTimes = new List<double>(requestedClipTimes.Length);
+				foreach (double clipTime in requestedClipTimes) {
+					double sourceTime = assignment.offsetSec + clipTime;
+					if (sourceTime >= sourceSeconds - 0.1 || clipTime >= clipSeconds - 0.1)
+						continue;
+					clipTimes.Add(clipTime);
+					sourceTimes.Add(sourceTime);
+				}
+				clipTimesByAssignment[assignmentIndex] = clipTimes.ToArray();
+				sourceTimesByAssignment[assignmentIndex] = sourceTimes.ToArray();
+				sourceFramesByAssignment[assignmentIndex] = Array.Empty<byte[]?>();
 			}
 
-			Logger.Instance.Info($"Partial clip detection: checked {pairsChecked} pair(s), found {matches.Count} candidate match(es), formed {assignments.Count} clip-source assignment(s).");
+			var sourceGroups = Enumerable.Range(0, assignments.Count)
+				.GroupBy(index => assignments[index].sourceIdx)
+				.OrderBy(group => group.Key)
+				.Select(group => (
+					SourceIndex: group.Key,
+					AssignmentIndices: group.ToArray()))
+				.ToArray();
+			long uniqueSourceTimeCount = 0;
+
+			BeginComparisonStage(
+				ComparisonStage.PartialVisualSourceSampling,
+				sourceGroups.Length,
+				effectiveParallelism: workerCount);
+			try {
+				Parallel.ForEach(
+					sourceGroups,
+					new ParallelOptions {
+						CancellationToken = cancelationTokenSource.Token,
+						MaxDegreeOfParallelism = workerCount,
+					},
+					group => {
+						Interlocked.Increment(ref comparisonActiveWorkers);
+						try {
+							pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+							var uniqueTimes = new SortedSet<double>();
+							foreach (int assignmentIndex in group.AssignmentIndices)
+								foreach (double sourceTime in sourceTimesByAssignment[assignmentIndex])
+									uniqueTimes.Add(sourceTime);
+
+							double[] orderedTimes = uniqueTimes.ToArray();
+							Interlocked.Add(ref uniqueSourceTimeCount, orderedTimes.Length);
+							byte[]?[] orderedFrames = orderedTimes.Length == 0
+								? Array.Empty<byte[]?>()
+								: FfmpegEngine.GetGrayFrames(
+									videos[group.SourceIndex].Path,
+									orderedTimes,
+									Settings.ExtendedFFToolsLogging,
+									extractionStats);
+							var framesByTime = new Dictionary<double, byte[]?>(orderedTimes.Length);
+							for (int i = 0; i < orderedTimes.Length; i++)
+								framesByTime[orderedTimes[i]] = orderedFrames[i];
+
+							foreach (int assignmentIndex in group.AssignmentIndices) {
+								double[] assignmentTimes = sourceTimesByAssignment[assignmentIndex];
+								var alignedFrames = new byte[]?[assignmentTimes.Length];
+								for (int i = 0; i < assignmentTimes.Length; i++)
+									alignedFrames[i] = framesByTime[assignmentTimes[i]];
+								sourceFramesByAssignment[assignmentIndex] = alignedFrames;
+							}
+						}
+						finally {
+							AddComparisonProgress(1);
+							Interlocked.Decrement(ref comparisonActiveWorkers);
+						}
+					});
+				CompleteComparisonStage();
+			}
+			catch {
+				StopComparisonStage();
+				throw;
+			}
+
+			var verified = new ConcurrentBag<(int, int, float, int, Guid)>();
+			int droppedCount = 0;
+			BeginComparisonStage(
+				ComparisonStage.PartialVisualClipVerification,
+				assignments.Count,
+				effectiveParallelism: workerCount);
+			try {
+				Parallel.For(
+					0,
+					assignments.Count,
+					new ParallelOptions {
+						CancellationToken = cancelationTokenSource.Token,
+						MaxDegreeOfParallelism = workerCount,
+					},
+					assignmentIndex => {
+						Interlocked.Increment(ref comparisonActiveWorkers);
+						try {
+							pauseTokenSource.WaitWhilePaused(cancelationTokenSource.Token);
+							var assignment = assignments[assignmentIndex];
+							double[] clipTimes = clipTimesByAssignment[assignmentIndex];
+							byte[]?[] clipFrames = clipTimes.Length == 0
+								? Array.Empty<byte[]?>()
+								: FfmpegEngine.GetGrayFrames(
+									videos[assignment.clipIdx].Path,
+									clipTimes,
+									Settings.ExtendedFFToolsLogging,
+									extractionStats);
+							bool pass = PartialVisualVerificationUtils.CompareFrames(
+								sourceFramesByAssignment[assignmentIndex],
+								clipFrames,
+								Settings.UsePHashing,
+								Settings.PartialClipVisualThreshold,
+								out float visualSimilarity);
+							if (pass) {
+								verified.Add(assignment);
+							}
+							else {
+								Interlocked.Increment(ref droppedCount);
+								if (Settings.ExtendedFFToolsLogging)
+									Logger.Instance.Info(
+										$"[Partial] Visual gate dropped " +
+										$"{System.IO.Path.GetFileName(videos[assignment.clipIdx].Path)} in " +
+										$"{System.IO.Path.GetFileName(videos[assignment.sourceIdx].Path)}: " +
+										$"visualSim={visualSimilarity:P1} " +
+										$"(threshold {Settings.PartialClipVisualThreshold:P0})");
+							}
+						}
+						finally {
+							AddComparisonProgress(1);
+							Interlocked.Decrement(ref comparisonActiveWorkers);
+						}
+					});
+				CompleteComparisonStage();
+			}
+			catch {
+				StopComparisonStage();
+				throw;
+			}
+
+			visualTimer.Stop();
+			dropped = droppedCount;
+			Logger.Instance.Info(
+				$"Partial visual confirmation: sources={sourceGroups.Length:N0}, " +
+				$"unique source times={uniqueSourceTimeCount:N0}, assignments={assignments.Count:N0}, " +
+				$"workers={workerCount}, native sessions={extractionStats.NativeSessions:N0}, " +
+				$"CLI batches={extractionStats.CliBatches:N0}, fallback frames={extractionStats.FallbackFrames:N0}, " +
+				$"elapsed={visualTimer.Elapsed}.");
+			return verified
+				.OrderBy(assignment => assignment.Item1)
+				.ThenBy(assignment => assignment.Item2)
+				.ToList();
 		}
 
 		/// <summary>
@@ -1373,29 +1944,12 @@ namespace VDF.Core {
 
 			// Sample times in clip-local seconds. Avoid the very edges so intros/outros
 			// (often black or text-only) don't dominate the result.
-			var clipTimes = new List<double>(3);
-			if (clipSec >= 9.0) {
-				clipTimes.Add(clipSec * 0.25);
-				clipTimes.Add(clipSec * 0.50);
-				clipTimes.Add(clipSec * 0.75);
-			}
-			else if (clipSec >= 3.0) {
-				clipTimes.Add(clipSec * 0.33);
-				clipTimes.Add(clipSec * 0.66);
-			}
-			else {
-				clipTimes.Add(clipSec * 0.5);
-			}
-
-			bool useP = Settings.UsePHashing;
-			double threshold = Settings.PartialClipVisualThreshold;
-			int comparisons = 0;
-			float simSum = 0f;
+			double[] clipTimes = PartialVisualVerificationUtils.BuildClipTimes(clipSec);
 
 			// Collect the usable sample times first so each file is decoded in a single
 			// batched session instead of one decoder open per frame.
-			var srcSampleTimes = new List<double>(clipTimes.Count);
-			var clipSampleTimes = new List<double>(clipTimes.Count);
+			var srcSampleTimes = new List<double>(clipTimes.Length);
+			var clipSampleTimes = new List<double>(clipTimes.Length);
 			foreach (double t in clipTimes) {
 				double srcAt = offsetSec + t;
 				if (srcAt >= sourceSec - 0.1 || t >= clipSec - 0.1) continue;
@@ -1407,28 +1961,12 @@ namespace VDF.Core {
 			byte[]?[] srcFrames = FfmpegEngine.GetGrayFrames(source.Path, srcSampleTimes, Settings.ExtendedFFToolsLogging);
 			byte[]?[] clipFrames = FfmpegEngine.GetGrayFrames(clip.Path, clipSampleTimes, Settings.ExtendedFFToolsLogging);
 
-			for (int i = 0; i < srcSampleTimes.Count; i++) {
-				byte[]? srcFrame = srcFrames[i];
-				byte[]? clipFrame = clipFrames[i];
-				if (srcFrame == null || clipFrame == null) continue;
-
-				float pairSim;
-				if (useP) {
-					ulong hSrc = pHash.PerceptualHash.ComputePHashFromGray32x32(srcFrame);
-					ulong hClip = pHash.PerceptualHash.ComputePHashFromGray32x32(clipFrame);
-					pHash.PHashCompare.IsDuplicateByPercent(hSrc, hClip, out pairSim, threshold, strict: true);
-				}
-				else {
-					float diff = GrayBytesUtils.PercentageDifference(srcFrame, clipFrame);
-					pairSim = 1f - diff;
-				}
-				simSum += pairSim;
-				comparisons++;
-			}
-
-			if (comparisons == 0) return true;
-			visualSim = simSum / comparisons;
-			return visualSim >= threshold;
+			return PartialVisualVerificationUtils.CompareFrames(
+				srcFrames,
+				clipFrames,
+				Settings.UsePHashing,
+				Settings.PartialClipVisualThreshold,
+				out visualSim);
 		}
 
 		/// <summary>
@@ -1836,7 +2374,7 @@ namespace VDF.Core {
 			Logger.Instance.Info($"Explicit thumbnail retry: starting for {dupList.Count} item(s).");
 			int loaded = 0, placeholders = 0, skippedMissing = 0;
 			try {
-				await Parallel.ForEachAsync(dupList, new ParallelOptions { MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, (entry, cancellationToken) => {
+				await Parallel.ForEachAsync(dupList, new ParallelOptions { MaxDegreeOfParallelism = ThumbnailParallelism }, (entry, cancellationToken) => {
 					List<byte[]>? list = null;
 					bool needsThumbnails = !Settings.IncludeNonExistingFiles || File.Exists(entry.Path);
 					List<TimeSpan>? timeStamps = null;
@@ -1909,7 +2447,7 @@ namespace VDF.Core {
 			var totalSw = Stopwatch.StartNew();
 			var sw = Stopwatch.StartNew();
 			try {
-				await Parallel.ForEachAsync(dupList, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = Settings.MaxDegreeOfParallelism }, (entry, cancellationToken) => {
+				await Parallel.ForEachAsync(dupList, new ParallelOptions { CancellationToken = cancelationTokenSource.Token, MaxDegreeOfParallelism = ThumbnailParallelism }, (entry, cancellationToken) => {
 					List<byte[]>? list = null;
 					bool needsThumbnails = !Settings.IncludeNonExistingFiles || File.Exists(entry.Path);
 					List<TimeSpan>? timeStamps = null;

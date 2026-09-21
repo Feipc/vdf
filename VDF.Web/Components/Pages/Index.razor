@@ -44,7 +44,7 @@
     <div class="error-box">
         <strong>Error</strong>
         <p>@Scan.ErrorMessage</p>
-        <button @onclick="Scan.Reset">Dismiss</button>
+        <button @onclick="Scan.DismissError">Dismiss</button>
     </div>
 }
 
@@ -67,11 +67,33 @@
             }
         }
         else {
-            <p class="state-label">
-                <span class="spinner"></span>
-                Comparing @(Scan.FilesHashed > 0 ? $"{Scan.FilesHashed:N0} hashed files" : "files") for duplicates...
-            </p>
-            <p class="comparing-note">This may take a while depending on library size.</p>
+            @if (Scan.LastComparisonProgress is { } comparison) {
+                int pct = comparison.Total > 0
+                    ? (int)Math.Clamp(100d * comparison.Current / comparison.Total, 0d, 100d)
+                    : 0;
+                <p class="state-label">@FormatComparisonStage(comparison.Stage)</p>
+                @if (comparison.Total > 0) {
+                    <div class="progress-bar-track">
+                        <div class="progress-bar-fill" style="width:@pct%"></div>
+                    </div>
+                    <p>
+                        @comparison.Current.ToString("N0") / @comparison.Total.ToString("N0")
+                        &nbsp;|&nbsp; @comparison.ItemsPerSecond.ToString("N0") @FormatRateUnit(comparison.Stage)
+                        &nbsp;|&nbsp; ETA @FormatEta(comparison.Remaining)
+                    </p>
+                }
+                <p class="comparing-note">
+                    Workers: @comparison.ActiveWorkers / @comparison.EffectiveParallelism
+                    &nbsp;|&nbsp; Elapsed @FormatEta(comparison.Elapsed)
+                </p>
+            }
+            else {
+                <p class="state-label">
+                    <span class="spinner"></span>
+                    Comparing @(Scan.FilesHashed > 0 ? $"{Scan.FilesHashed:N0} hashed files" : "files") for duplicates...
+                </p>
+                <p class="comparing-note">Preparing comparison...</p>
+            }
         }
         <div class="actions">
             <button @onclick="Scan.Pause">Pause</button>
@@ -123,7 +145,7 @@ else {
 
         <div class="start-row">
             @if (Scan.State == ScanState.Done || Scan.State == ScanState.Aborted || Scan.State == ScanState.Error) {
-                <button @onclick="Scan.Reset">Reset</button>
+                <button @onclick="RequestReset">Reset</button>
             }
             <button @onclick="SaveSettings" title="Save current settings to disk">Save settings</button>
             <button class="primary" @onclick="Scan.StartScanAndCompare"
@@ -131,6 +153,15 @@ else {
                 Start Scan
             </button>
         </div>
+
+        @if (_confirmClearResults) {
+            <div class="confirm-panel">
+                <strong>Clear @Scan.Duplicates.Count saved result item(s)?</strong>
+                <span>The scan/hash database is kept, but the saved Results list will be removed.</span>
+                <button class="danger" @onclick="ConfirmReset">Clear Results</button>
+                <button @onclick="() => _confirmClearResults = false">Cancel</button>
+            </div>
+        }
 
         @if (_saveMsg != null) {
             <p class="@(_saveFailed ? "aborted-msg" : "done-msg")">@_saveMsg</p>
@@ -151,6 +182,7 @@ else {
     FolderBrowser? _excludeBrowser;
     string? _saveMsg;
     bool _saveFailed;
+    bool _confirmClearResults;
 
     protected override void OnInitialized() {
         Scan.StateChanged += OnStateChanged;
@@ -163,6 +195,18 @@ else {
     }
 
     void RetryFfmpegSetup() => _ = FFmpegSetup.CheckAndSetupAsync();
+
+    void RequestReset() {
+        if (Scan.Duplicates.Count > 0)
+            _confirmClearResults = true;
+        else
+            Scan.Reset();
+    }
+
+    void ConfirmReset() {
+        _confirmClearResults = false;
+        Scan.Reset();
+    }
 
     void AddInclude() {
         var path = _newInclude.Trim();
@@ -217,8 +261,38 @@ else {
         }));
     }
 
-    static string FormatEta(TimeSpan eta) =>
-        eta == TimeSpan.Zero ? "..." : eta.ToString(@"m\mss\s");
+    static string FormatEta(TimeSpan eta) {
+        if (eta == TimeSpan.Zero || eta == TimeSpan.MaxValue) return "...";
+        if (eta.TotalDays >= 1) return $"{(int)eta.TotalDays}d {eta.Hours}h";
+        if (eta.TotalHours >= 1) return $"{(int)eta.TotalHours}h {eta.Minutes}m";
+        return $"{eta.Minutes}m {eta.Seconds}s";
+    }
+
+    static string FormatComparisonStage(ComparisonStage stage) => stage switch {
+        ComparisonStage.VisualComparison => "Comparing visual fingerprints...",
+        ComparisonStage.PartialCandidatePlanning => "Planning exact partial-clip candidates...",
+        ComparisonStage.PartialIndexBuilding => "Building partial-clip fingerprint index...",
+        ComparisonStage.PartialCandidateSearch => "Searching partial-clip candidates...",
+        ComparisonStage.PartialAudioComparison => "Comparing partial-clip audio fingerprints...",
+        ComparisonStage.PartialExactVerification => "Exactly verifying partial-clip candidates...",
+        ComparisonStage.PartialVisualVerification => "Visually verifying partial clips...",
+        ComparisonStage.PartialVisualSourceSampling => "Sampling partial-clip source frames...",
+        ComparisonStage.PartialVisualClipVerification => "Visually verifying partial clips...",
+        ComparisonStage.GroupingResults => "Grouping duplicate results...",
+        ComparisonStage.SavingDatabase => "Saving scan database...",
+        _ => "Comparing files...",
+    };
+
+    static string FormatRateUnit(ComparisonStage stage) => stage switch {
+        ComparisonStage.VisualComparison => "files/s",
+        ComparisonStage.PartialAudioComparison => "pairs/s",
+        ComparisonStage.PartialExactVerification => "pairs/s",
+        ComparisonStage.PartialCandidateSearch => "clips/s",
+        ComparisonStage.PartialIndexBuilding => "tables/s",
+        ComparisonStage.PartialVisualSourceSampling => "sources/s",
+        ComparisonStage.PartialVisualClipVerification => "clips/s",
+        _ => "items/s",
+    };
 
     static string TruncatePath(string path, int max) =>
         path.Length <= max ? path : "..." + path[^(max - 3)..];

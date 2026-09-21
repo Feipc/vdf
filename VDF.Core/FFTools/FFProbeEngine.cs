@@ -69,9 +69,15 @@ namespace VDF.Core.FFTools {
 					process.BeginErrorReadLine();
 				}
 				using var ms = new MemoryStream();
-				process.StandardOutput.BaseStream.CopyTo(ms);
-				if (!process.WaitForExit(TimeoutDuration))
+				bool outputCompleted = ProcessStreamCopy.CopyTo(
+					process.StandardOutput.BaseStream,
+					ms,
+					TimeSpan.FromMilliseconds(TimeoutDuration),
+					() => process.Kill(entireProcessTree: true));
+				if (!outputCompleted)
 					throw new TimeoutException($"FFprobe timed out on file: {file}");
+				if (!process.WaitForExit(TimeoutDuration))
+					throw new TimeoutException($"FFprobe timed out while exiting on file: {file}");
 				else if (extendedLogging)
 					process.WaitForExit(); // Because of asynchronous event handlers, see: https://github.com/dotnet/runtime/issues/18789
 
@@ -84,7 +90,7 @@ namespace VDF.Core.FFTools {
 				errOut += $"{Environment.NewLine}{e.Message}";
 				try {
 					if (process.HasExited == false)
-						process.Kill();
+						process.Kill(entireProcessTree: true);
 				}
 				catch { }
 				mediaInfo = null;
@@ -125,14 +131,22 @@ namespace VDF.Core.FFTools {
 			using var process = new Process { StartInfo = psi };
 			try {
 				process.Start();
-				string output = process.StandardOutput.ReadToEnd();
+				using var outputBuffer = new MemoryStream();
+				bool outputCompleted = ProcessStreamCopy.CopyTo(
+					process.StandardOutput.BaseStream,
+					outputBuffer,
+					TimeSpan.FromMilliseconds(TimeoutDuration),
+					() => process.Kill(entireProcessTree: true));
+				if (!outputCompleted)
+					return null;
 				if (!process.WaitForExit(TimeoutDuration)) {
-					try { if (!process.HasExited) process.Kill(); } catch { }
+					try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
 					return null;
 				}
 				if (process.ExitCode != 0)
 					return null;
 
+				string output = System.Text.Encoding.UTF8.GetString(outputBuffer.ToArray());
 				output = output.Trim();
 				if (output.Length == 0)
 					return null;
@@ -144,10 +158,9 @@ namespace VDF.Core.FFTools {
 			}
 			catch (Exception e) {
 				Logger.Instance.Info($"Failed reading creation_time from '{file}': {e.Message}");
-				try { if (!process.HasExited) process.Kill(); } catch { }
+				try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
 			}
 			return null;
 		}
 	}
 }
-

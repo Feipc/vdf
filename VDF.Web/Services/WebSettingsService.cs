@@ -18,6 +18,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using VDF.Core;
 using VDF.Core.FFTools;
+using VDF.Core.Utils;
 
 namespace VDF.Web.Services {
 	public sealed class WebSettingsService {
@@ -29,6 +30,14 @@ namespace VDF.Web.Services {
 			public float Percent { get; set; } = 96f;
 			public double PercentDurationDifference { get; set; } = 20d;
 			public int MaxDegreeOfParallelism { get; set; } = 1;
+			public int MetadataMaxDegreeOfParallelism { get; set; }
+			public int FrameHashMaxDegreeOfParallelism { get; set; }
+			public int AudioHashMaxDegreeOfParallelism { get; set; }
+			public int VisualCompareMaxDegreeOfParallelism { get; set; }
+			public int PHashCompareMaxDegreeOfParallelism { get; set; }
+			public int PartialIndexMaxDegreeOfParallelism { get; set; }
+			public int PartialExactMaxDegreeOfParallelism { get; set; }
+			public int ThumbnailMaxDegreeOfParallelism { get; set; }
 			public int ThumbnailCount { get; set; } = 1;
 			public bool IncludeSubDirectories { get; set; } = true;
 			public bool IncludeImages { get; set; } = true;
@@ -69,6 +78,11 @@ namespace VDF.Web.Services {
 			public double PartialClipSimilarityThreshold { get; set; } = 0.80;
 			public bool PartialClipRequireVisualMatch { get; set; } = true;
 			public double PartialClipVisualThreshold { get; set; } = 0.85;
+			public int PartialClipVisualMaxDegreeOfParallelism { get; set; } = 6;
+			[JsonConverter(typeof(JsonStringEnumConverter<PartialClipSearchMode>))]
+			public PartialClipSearchMode PartialClipSearchMode { get; set; } = VDF.Core.PartialClipSearchMode.FastBalanced;
+			public int PartialClipMaxCandidates { get; set; } = 256;
+			public int PartialClipIndexMemoryLimitMB { get; set; } = 8192;
 
 			// WebUI-only settings (not in VDF.Core Settings)
 			/// <summary>Whether to automatically load HQ thumbnails on the results page.</summary>
@@ -98,6 +112,9 @@ namespace VDF.Web.Services {
 			}
 		}
 
+		public static string DefaultWorkerProfilePath =>
+			Path.Combine(Path.GetDirectoryName(SettingsPath)!, "worker-profile.json");
+
 		public bool Load(Settings s) {
 			if (!File.Exists(SettingsPath)) return false;
 			try {
@@ -109,6 +126,14 @@ namespace VDF.Web.Services {
 				s.Percent = dto.Percent;
 				s.PercentDurationDifference = dto.PercentDurationDifference;
 				s.MaxDegreeOfParallelism = dto.MaxDegreeOfParallelism;
+				s.MetadataMaxDegreeOfParallelism = NormalizeStageWorkers(dto.MetadataMaxDegreeOfParallelism);
+				s.FrameHashMaxDegreeOfParallelism = NormalizeStageWorkers(dto.FrameHashMaxDegreeOfParallelism);
+				s.AudioHashMaxDegreeOfParallelism = NormalizeStageWorkers(dto.AudioHashMaxDegreeOfParallelism);
+				s.VisualCompareMaxDegreeOfParallelism = NormalizeStageWorkers(dto.VisualCompareMaxDegreeOfParallelism);
+				s.PHashCompareMaxDegreeOfParallelism = NormalizeStageWorkers(dto.PHashCompareMaxDegreeOfParallelism);
+				s.PartialIndexMaxDegreeOfParallelism = NormalizeStageWorkers(dto.PartialIndexMaxDegreeOfParallelism);
+				s.PartialExactMaxDegreeOfParallelism = NormalizeStageWorkers(dto.PartialExactMaxDegreeOfParallelism);
+				s.ThumbnailMaxDegreeOfParallelism = NormalizeStageWorkers(dto.ThumbnailMaxDegreeOfParallelism);
 				s.ThumbnailCount = dto.ThumbnailCount;
 				s.IncludeSubDirectories = dto.IncludeSubDirectories;
 				s.IncludeImages = dto.IncludeImages;
@@ -147,6 +172,15 @@ namespace VDF.Web.Services {
 				s.PartialClipSimilarityThreshold = dto.PartialClipSimilarityThreshold;
 				s.PartialClipRequireVisualMatch = dto.PartialClipRequireVisualMatch;
 				s.PartialClipVisualThreshold = dto.PartialClipVisualThreshold;
+				s.PartialClipVisualMaxDegreeOfParallelism = Math.Clamp(
+					dto.PartialClipVisualMaxDegreeOfParallelism <= 0
+						? 6
+						: dto.PartialClipVisualMaxDegreeOfParallelism,
+					1,
+					16);
+				s.PartialClipSearchMode = dto.PartialClipSearchMode;
+				s.PartialClipMaxCandidates = Math.Clamp(dto.PartialClipMaxCandidates, 1, 4096);
+				s.PartialClipIndexMemoryLimitMB = Math.Clamp(dto.PartialClipIndexMemoryLimitMB, 128, 32768);
 				// WebUI-only
 				AutoLoadThumbnails = dto.AutoLoadThumbnails;
 				ThumbnailWidth = Math.Clamp(dto.ThumbnailWidth, 48, 960);
@@ -166,6 +200,14 @@ namespace VDF.Web.Services {
 					Percent = s.Percent,
 					PercentDurationDifference = s.PercentDurationDifference,
 					MaxDegreeOfParallelism = s.MaxDegreeOfParallelism,
+					MetadataMaxDegreeOfParallelism = NormalizeStageWorkers(s.MetadataMaxDegreeOfParallelism),
+					FrameHashMaxDegreeOfParallelism = NormalizeStageWorkers(s.FrameHashMaxDegreeOfParallelism),
+					AudioHashMaxDegreeOfParallelism = NormalizeStageWorkers(s.AudioHashMaxDegreeOfParallelism),
+					VisualCompareMaxDegreeOfParallelism = NormalizeStageWorkers(s.VisualCompareMaxDegreeOfParallelism),
+					PHashCompareMaxDegreeOfParallelism = NormalizeStageWorkers(s.PHashCompareMaxDegreeOfParallelism),
+					PartialIndexMaxDegreeOfParallelism = NormalizeStageWorkers(s.PartialIndexMaxDegreeOfParallelism),
+					PartialExactMaxDegreeOfParallelism = NormalizeStageWorkers(s.PartialExactMaxDegreeOfParallelism),
+					ThumbnailMaxDegreeOfParallelism = NormalizeStageWorkers(s.ThumbnailMaxDegreeOfParallelism),
 					ThumbnailCount = s.ThumbnailCount,
 					IncludeSubDirectories = s.IncludeSubDirectories,
 					IncludeImages = s.IncludeImages,
@@ -204,6 +246,11 @@ namespace VDF.Web.Services {
 					PartialClipSimilarityThreshold = s.PartialClipSimilarityThreshold,
 					PartialClipRequireVisualMatch = s.PartialClipRequireVisualMatch,
 					PartialClipVisualThreshold = s.PartialClipVisualThreshold,
+					PartialClipVisualMaxDegreeOfParallelism =
+						Math.Clamp(s.PartialClipVisualMaxDegreeOfParallelism, 1, 16),
+					PartialClipSearchMode = s.PartialClipSearchMode,
+					PartialClipMaxCandidates = s.PartialClipMaxCandidates,
+					PartialClipIndexMemoryLimitMB = s.PartialClipIndexMemoryLimitMB,
 					// WebUI-only
 					AutoLoadThumbnails = AutoLoadThumbnails,
 					ThumbnailWidth = ThumbnailWidth,
@@ -214,5 +261,76 @@ namespace VDF.Web.Services {
 			}
 			catch { return false; }
 		}
+
+		public static bool TryImportWorkerProfile(
+			Settings settings,
+			Stream json,
+			out WorkerProfile? profile,
+			out string? error) {
+			try {
+				profile = JsonSerializer.Deserialize(json, CoreJsonContext.Default.WorkerProfile);
+				if (profile == null) {
+					error = "The selected file does not contain a worker profile.";
+					return false;
+				}
+				if (!profile.TryValidate(out error))
+					return false;
+				profile.ApplyTo(settings);
+				return true;
+			}
+			catch (Exception exception) {
+				profile = null;
+				error = $"Could not import worker profile: {exception.Message}";
+				return false;
+			}
+		}
+
+		public static bool TryImportSavedWorkerProfile(
+			Settings settings,
+			out WorkerProfile? profile,
+			out string? error) {
+			if (!File.Exists(DefaultWorkerProfilePath)) {
+				profile = null;
+				error = $"No benchmark profile was found at {DefaultWorkerProfilePath}.";
+				return false;
+			}
+			using FileStream stream = File.OpenRead(DefaultWorkerProfilePath);
+			return TryImportWorkerProfile(settings, stream, out profile, out error);
+		}
+
+		public static WorkerProfile CreateWorkerProfile(Settings settings) =>
+			new() {
+				Completed = true,
+				VisibleCpuCount = Environment.ProcessorCount,
+				Preset = "manual",
+				MetadataWorkers = ResolveExportValue(
+					settings.MetadataMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				FrameHashWorkers = ResolveExportValue(
+					settings.FrameHashMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				AudioHashWorkers = ResolveExportValue(
+					settings.AudioHashMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				VisualCompareWorkers = ResolveExportValue(
+					settings.VisualCompareMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PHashCompareWorkers = ResolveExportValue(
+					settings.PHashCompareMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialIndexWorkers = ResolveExportValue(
+					settings.PartialIndexMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialExactWorkers = ResolveExportValue(
+					settings.PartialExactMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialVisualSourceWorkers = Math.Clamp(
+					settings.PartialClipVisualMaxDegreeOfParallelism, 1, 16),
+				PartialVisualClipWorkers = Math.Clamp(
+					settings.PartialClipVisualMaxDegreeOfParallelism, 1, 16),
+				ThumbnailWorkers = ResolveExportValue(
+					settings.ThumbnailMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+			};
+
+		static int ResolveExportValue(int stageValue, int globalValue) =>
+			WorkerParallelism.Resolve(stageValue, globalValue);
+
+		static int NormalizeStageWorkers(int value) =>
+			value == -1 || value is >= 0 and <= WorkerParallelism.MaximumConfiguredWorkers
+				? value
+				: 0;
 	}
 }

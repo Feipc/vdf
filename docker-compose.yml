@@ -1,21 +1,14 @@
 services:
   vdf-web:
-    image: ghcr.io/0x90d/vdf-web:latest
+    build:
+      context: .
+      dockerfile: VDF.Web/Dockerfile
+    image: vdf-web:compare-optimized
     ports:
-      - "8080:8080"
-    # environment:
-    #   - VDF_WEB_PASSWORD=changeme   # set a password (otherwise auto-generated — check docker logs)
-    #   - VDF_WEB_AUTH=false          # set to disable authentication entirely
+      - "7777:8080"
+    environment:
+      - VDF_WEB_PASSWORD=111
     volumes:
-      # Add your media directories below (host_path:container_path:ro)
-      # Example:
-      #   - /mnt/nas/movies:/mnt/nas/movies:ro
-      #   - "/mnt/path with spaces:/mnt/media:ro"
-      - vdf-db:/root/.config/VDF         # web-settings.json, web-credentials.json
-      - vdf-state:/root/.local/state/VDF # ScannedFiles.db
-
-volumes:
-  vdf-db:
-    driver: local
-  vdf-state:
-    driver: local
+      - /volume7/Datastore1/Videos:/mnt/Videos
+      - /volume5/docker/vdf/config:/root/.config/VDF
+      - /volume5/docker/vdf/db:/root/.local/state/VDF

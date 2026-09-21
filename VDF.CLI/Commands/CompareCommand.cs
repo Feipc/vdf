@@ -27,8 +27,17 @@ namespace VDF.CLI.Commands {
 			cmd.Options.Add(SharedOptions.Percent);
 			cmd.Options.Add(SharedOptions.Parallelism);
 			cmd.Options.Add(SharedOptions.IncludeImages);
+			cmd.Options.Add(SharedOptions.UsePhash);
+			cmd.Options.Add(SharedOptions.NativeFfmpeg);
+			cmd.Options.Add(SharedOptions.HardwareAccel);
+			cmd.Options.Add(SharedOptions.CustomFfArgs);
 			cmd.Options.Add(SharedOptions.Database);
 			cmd.Options.Add(SharedOptions.IncludeNonExistingFiles);
+			cmd.Options.Add(SharedOptions.EnablePartialClipDetection);
+			cmd.Options.Add(SharedOptions.PartialClipRequireVisualMatch);
+			cmd.Options.Add(SharedOptions.PartialClipVisualThreshold);
+			cmd.Options.Add(SharedOptions.PartialClipSearchMode);
+			cmd.Options.Add(SharedOptions.PartialClipVisualParallelism);
 			cmd.Options.Add(SharedOptions.SettingsFile);
 			cmd.Options.Add(SharedOptions.Format);
 			cmd.Options.Add(SharedOptions.Output);

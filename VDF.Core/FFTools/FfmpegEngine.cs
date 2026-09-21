@@ -25,6 +25,20 @@ using VDF.Core.FFTools.FFmpegNative;
 using VDF.Core.Utils;
 
 namespace VDF.Core.FFTools {
+	internal sealed class GrayFrameExtractionStats {
+		long nativeSessions;
+		long cliBatches;
+		long fallbackFrames;
+
+		internal long NativeSessions => Interlocked.Read(ref nativeSessions);
+		internal long CliBatches => Interlocked.Read(ref cliBatches);
+		internal long FallbackFrames => Interlocked.Read(ref fallbackFrames);
+
+		internal void AddNativeSession() => Interlocked.Increment(ref nativeSessions);
+		internal void AddCliBatch() => Interlocked.Increment(ref cliBatches);
+		internal void AddFallbackFrames(int count) => Interlocked.Add(ref fallbackFrames, count);
+	}
+
 	internal static class FfmpegEngine {
 		static string _FFmpegPath = string.Empty;
 		// Re-probes when unresolved (or the binary vanished): a once-only static cache made
@@ -271,13 +285,19 @@ namespace VDF.Core.FFTools {
 		/// reusing one sws context for the whole file instead of paying the open/seek/teardown
 		/// cost per frame. Returns an array aligned with <paramref name="positionsSeconds"/>;
 		/// entries are null when that frame could not be decoded. Positions the native batch
-		/// could not produce (or all of them, without the native binding) fall back to the
-		/// per-frame <see cref="GetThumbnail"/> path, which itself falls back to the FFmpeg process.
+		/// could not produce (or all of them, without the native binding) are extracted by
+		/// FFmpeg process batches of at most 24 seeks. Any batch output that cannot be
+		/// validated falls back to the existing per-frame <see cref="GetThumbnail"/> path.
 		/// </summary>
-		internal static unsafe byte[]?[] GetGrayFrames(string filePath, IReadOnlyList<double> positionsSeconds, bool extendedLogging) {
+		internal static unsafe byte[]?[] GetGrayFrames(
+			string filePath,
+			IReadOnlyList<double> positionsSeconds,
+			bool extendedLogging,
+			GrayFrameExtractionStats? stats = null) {
 			const int N = 32;
 			var frames = new byte[]?[positionsSeconds.Count];
 			if (ShouldUseNativeBinding) {
+				stats?.AddNativeSession();
 				try {
 					FfmpegLogCapture.Reset();
 					using var vsd = new VideoStreamDecoder(filePath, GetConfiguredHardwareDeviceType());
@@ -322,14 +342,182 @@ namespace VDF.Core.FFTools {
 				}
 			}
 
+			var missingIndices = new List<int>();
+			for (int i = 0; i < frames.Length; i++)
+				if (frames[i] == null)
+					missingIndices.Add(i);
+
+			foreach ((int start, int count) in PartialVisualVerificationUtils.GetBatches(
+				missingIndices.Count,
+				PartialVisualVerificationUtils.CliBatchSize)) {
+				var batchPositions = new double[count];
+				for (int i = 0; i < count; i++)
+					batchPositions[i] = positionsSeconds[missingIndices[start + i]];
+				stats?.AddCliBatch();
+				if (!TryGetGrayFramesProcessBatch(
+					filePath,
+					batchPositions,
+					extendedLogging,
+					out byte[]?[] batchFrames))
+					continue;
+				for (int i = 0; i < count; i++)
+					frames[missingIndices[start + i]] = batchFrames[i];
+			}
+
+			int fallbackCount = 0;
 			for (int i = 0; i < positionsSeconds.Count; i++) {
-				frames[i] ??= GetThumbnail(new FfmpegSettings {
+				if (frames[i] != null)
+					continue;
+				fallbackCount++;
+				frames[i] = GetThumbnail(new FfmpegSettings {
 					File = filePath,
 					Position = TimeSpan.FromSeconds(positionsSeconds[i]),
 					GrayScale = 1
 				}, extendedLogging);
 			}
+			stats?.AddFallbackFrames(fallbackCount);
 			return frames;
+		}
+
+		static bool TryGetGrayFramesProcessBatch(
+			string filePath,
+			IReadOnlyList<double> positionsSeconds,
+			bool extendedLogging,
+			out byte[]?[] frames) {
+			const int N = 32;
+			const int bytesPerFrame = N * N;
+			frames = new byte[]?[positionsSeconds.Count];
+			if (positionsSeconds.Count == 0)
+				return true;
+			if (string.IsNullOrEmpty(FFmpegPath))
+				return false;
+
+			var psi = new ProcessStartInfo {
+				FileName = FFmpegPath,
+				CreateNoWindow = true,
+				RedirectStandardInput = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				WorkingDirectory = Path.GetDirectoryName(FFmpegPath)!,
+				WindowStyle = ProcessWindowStyle.Hidden,
+			};
+			psi.ArgumentList.Add("-hide_banner");
+			psi.ArgumentList.Add("-loglevel");
+			psi.ArgumentList.Add("error");
+			psi.ArgumentList.Add("-nostdin");
+
+			bool isImage = FileUtils.IsImageFile(filePath);
+			for (int i = 0; i < positionsSeconds.Count; i++) {
+				if (HardwareAccelerationMode != FFHardwareAccelerationMode.none) {
+					psi.ArgumentList.Add("-hwaccel");
+					psi.ArgumentList.Add(HardwareAccelerationMode.ToString());
+				}
+				if (!isImage) {
+					psi.ArgumentList.Add("-ss");
+					psi.ArgumentList.Add(
+						TimeSpan.FromSeconds(positionsSeconds[i])
+							.ToString(null, CultureInfo.InvariantCulture));
+				}
+				psi.ArgumentList.Add("-i");
+				psi.ArgumentList.Add(FFToolsUtils.LongPathFix(filePath));
+			}
+
+			string? userVfFilter = null;
+			var remainingCustomArgs = new List<string>();
+			if (!string.IsNullOrWhiteSpace(CustomFFArguments)) {
+				var tokens = TokenizeArgs(CustomFFArguments);
+				for (int i = 0; i < tokens.Count; i++) {
+					if ((tokens[i] == "-vf" || tokens[i] == "-filter:v") && i + 1 < tokens.Count)
+						userVfFilter = tokens[++i];
+					else
+						remainingCustomArgs.Add(tokens[i]);
+				}
+			}
+
+			var filter = new System.Text.StringBuilder();
+			for (int i = 0; i < positionsSeconds.Count; i++) {
+				if (filter.Length > 0)
+					filter.Append(';');
+				filter.Append('[').Append(i).Append(":v]");
+				if (userVfFilter != null)
+					filter.Append(userVfFilter).Append(',');
+				filter.Append($"scale={N}:{N}:flags=bicubic,format=gray,trim=end_frame=1,setpts=PTS-STARTPTS");
+				filter.Append(positionsSeconds.Count == 1 ? "[out]" : $"[v{i}]");
+			}
+			if (positionsSeconds.Count > 1) {
+				filter.Append(';');
+				for (int i = 0; i < positionsSeconds.Count; i++)
+					filter.Append("[v").Append(i).Append(']');
+				// Serialize all requested frames as one 32 x (32*N) raw frame. concat
+				// produces a multi-frame stream whose timestamps can collapse after every
+				// one-frame input is reset to PTS 0; FFmpeg's output sync then drops most
+				// frames (24 requests were observed as only 3 frames). vstack has no
+				// multi-frame timestamp synchronization and preserves input order, while
+				// its packed gray rows still split into the same 1024-byte frame blocks.
+				filter.Append("vstack=inputs=").Append(positionsSeconds.Count).Append("[out]");
+			}
+
+			psi.ArgumentList.Add("-filter_complex");
+			psi.ArgumentList.Add(filter.ToString());
+			psi.ArgumentList.Add("-map");
+			psi.ArgumentList.Add("[out]");
+			psi.ArgumentList.Add("-f");
+			psi.ArgumentList.Add("rawvideo");
+			psi.ArgumentList.Add("-pix_fmt");
+			psi.ArgumentList.Add("gray");
+			psi.ArgumentList.Add("-frames:v");
+			psi.ArgumentList.Add("1");
+			foreach (string arg in remainingCustomArgs)
+				psi.ArgumentList.Add(arg);
+			psi.ArgumentList.Add("pipe:1");
+
+			string error = string.Empty;
+			try {
+				using var process = new Process { StartInfo = psi };
+				process.Start();
+				Task<string> stderrTask = process.StandardError.ReadToEndAsync();
+				using var output = new MemoryStream(positionsSeconds.Count * bytesPerFrame);
+				bool outputCompleted = ProcessStreamCopy.CopyTo(
+					process.StandardOutput.BaseStream,
+					output,
+					TimeSpan.FromMilliseconds(TimeoutDuration),
+					() => process.Kill(entireProcessTree: true));
+				if (!outputCompleted) {
+					error = "FFmpeg batch frame extraction timed out.";
+					return false;
+				}
+				if (!process.WaitForExit(TimeoutDuration)) {
+					try { process.Kill(entireProcessTree: true); } catch { }
+					error = "FFmpeg batch frame extraction timed out while exiting.";
+					return false;
+				}
+				process.WaitForExit();
+				error = stderrTask.GetAwaiter().GetResult();
+				byte[] bytes = output.ToArray();
+				if (process.ExitCode != 0 || bytes.Length != positionsSeconds.Count * bytesPerFrame) {
+					error =
+						$"FFmpeg batch frame extraction returned exit={process.ExitCode}, " +
+						$"bytes={bytes.Length}, expected={positionsSeconds.Count * bytesPerFrame}. {error}";
+					return false;
+				}
+
+				for (int i = 0; i < positionsSeconds.Count; i++) {
+					var frame = new byte[bytesPerFrame];
+					Buffer.BlockCopy(bytes, i * bytesPerFrame, frame, 0, bytesPerFrame);
+					frames[i] = frame;
+				}
+				if (extendedLogging && error.Length > 0)
+					Logger.Instance.Info($"FFmpeg batch frame extraction warning for '{filePath}': {error}");
+				return true;
+			}
+			catch (Exception ex) {
+				error = ex.Message;
+				return false;
+			}
+			finally {
+				if (error.Length > 0 && extendedLogging)
+					Logger.Instance.Info($"FFmpeg batch frame extraction fallback for '{filePath}': {error}");
+			}
 		}
 
 		public static unsafe byte[]? GetThumbnail(FfmpegSettings settings, bool extendedLogging) {
@@ -540,11 +728,16 @@ namespace VDF.Core.FFTools {
 				});
 				process.BeginErrorReadLine();
 				using var ms = new MemoryStream();
-				process.StandardOutput.BaseStream.CopyTo(ms);
-
-				if (!process.WaitForExit(TimeoutDuration)) {
+				bool outputCompleted = ProcessStreamCopy.CopyTo(
+					process.StandardOutput.BaseStream,
+					ms,
+					TimeSpan.FromMilliseconds(TimeoutDuration),
+					() => process.Kill(entireProcessTree: true));
+				if (!outputCompleted) {
 					throw new TimeoutException($"FFmpeg timed out on file: {settings.File}");
 				}
+				if (!process.WaitForExit(TimeoutDuration))
+					throw new TimeoutException($"FFmpeg timed out while exiting on file: {settings.File}");
 				else
 					process.WaitForExit(); // Because of asynchronous event handlers, see: https://github.com/dotnet/runtime/issues/18789
 
@@ -563,7 +756,7 @@ namespace VDF.Core.FFTools {
 				errOut += $"{Environment.NewLine}{e.Message}";
 				try {
 					if (process.HasExited == false)
-						process.Kill();
+						process.Kill(entireProcessTree: true);
 				}
 				catch { }
 				bytes = null;

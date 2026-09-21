@@ -15,7 +15,9 @@
 //
 
 using VDF.Core;
+using VDF.Core.Utils;
 using VDF.Web.Services;
+using Microsoft.AspNetCore.StaticFiles;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -25,15 +27,33 @@ builder.Services.AddRazorComponents()
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddSingleton<AuthService>();
 builder.Services.AddSingleton<WebSettingsService>();
+builder.Services.AddSingleton<ResultThumbnailService>();
+builder.Services.AddSingleton<ResultSnapshotStore>();
 // ScanService is a singleton — one scan at a time, shared across all connections.
 builder.Services.AddSingleton<ScanService>();
 builder.Services.AddSingleton<FFmpegSetupService>();
 
 var app = builder.Build();
+app.Logger.LogInformation(
+	"Results thumbnail scheduler: max concurrent extractions {Workers}, cache limit {CacheMiB} MiB.",
+	ResultThumbnailService.DefaultMaxConcurrentExtractions,
+	ResultThumbnailService.DefaultMaxCacheBytes / (1024 * 1024));
 
 // Route unhandled exceptions from ScanEngine's async void methods (post-await) to ScanService
 // so they appear in the UI instead of crashing the process silently.
 var scanService = app.Services.GetRequiredService<ScanService>();
+if (!await scanService.InitializeAsync())
+	app.Logger.LogError(
+		"VDF Web initialization could not load the scan database. " +
+		"Saved Web results were not restored and destructive operations remain blocked.");
+app.Lifetime.ApplicationStopping.Register(() => {
+	try {
+		scanService.FlushResultsSnapshotAsync().GetAwaiter().GetResult();
+	}
+	catch (Exception ex) {
+		app.Logger.LogError(ex, "Could not flush Web results during shutdown");
+	}
+});
 
 AppDomain.CurrentDomain.UnhandledException += (_, e) => {
 	var ex = e.ExceptionObject as Exception
@@ -101,13 +121,26 @@ app.MapPost("/auth/login", async (HttpContext ctx, AuthService auth) => {
 // HQ thumbnail endpoint — extracts a fresh frame using configurable resolution and quality.
 // Used by the card-based results view for crisp thumbnails.
 var webSettings = app.Services.GetRequiredService<WebSettingsService>();
-app.MapGet("/thumbnail/hq", async (HttpContext ctx, ScanService scan) => {
+app.MapGet("/thumbnail/hq", async (
+	HttpContext ctx,
+	ScanService scan,
+	ResultThumbnailService thumbnails) => {
 	string? path = ctx.Request.Query["path"];
 	if (string.IsNullOrEmpty(path)) { ctx.Response.StatusCode = 400; return; }
 
-	path = Path.GetFullPath(path);
-	var item = scan.Duplicates.FirstOrDefault(d => d.Path == path);
+	var item = ResultPresentationUtils.FindResultByPath(
+		scan.Duplicates,
+		path,
+		out string normalizedPath);
 	if (item == null) { ctx.Response.StatusCode = 404; return; }
+	path = normalizedPath;
+	int index = int.TryParse(ctx.Request.Query["index"], out int requestedIndex)
+		? requestedIndex
+		: 0;
+	if (!ThumbnailPositionResolver.TryGetPosition(item, scan.Settings, index, out TimeSpan position)) {
+		ctx.Response.StatusCode = 400;
+		return;
+	}
 
 	// Honor the w/q the page requested (falling back to the current settings) so
 	// cached browser URLs stay consistent with the bytes they were rendered from.
@@ -116,19 +149,22 @@ app.MapGet("/thumbnail/hq", async (HttpContext ctx, ScanService scan) => {
 	width = Math.Clamp(width, 48, 960);
 	quality = Math.Clamp(quality, 10, 95);
 
-	var position = item.ThumbnailTimestamps.Count > 0
-		? item.ThumbnailTimestamps[0]
-		: TimeSpan.FromSeconds(item.Duration.TotalSeconds * 0.1);
+	string cacheKey = $"{path}|frame={index}|{position.TotalSeconds:F2}|{width}|{quality}";
 
-	string cacheKey = $"{path}|{position.TotalSeconds:F2}|{width}|{quality}";
-
-	if (!scan.HqThumbCache.TryGetValue(cacheKey, out var jpeg)) {
+	byte[]? jpeg;
+	try {
+		jpeg = await thumbnails.GetOrCreateAsync(
+			cacheKey,
+			() => ScanEngine.ExtractThumbnailJpeg(path, position, width, quality),
+			ctx.RequestAborted);
+	}
+	catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested) {
+		return;
+	}
+	if (jpeg == null || jpeg.Length == 0) {
 		// FFmpeg encodes at the requested quality directly — no re-encode pass needed.
-		jpeg = await Task.Run(() => ScanEngine.ExtractThumbnailJpeg(path, position, width, quality));
-		if (jpeg == null || jpeg.Length == 0) { ctx.Response.StatusCode = 204; return; }
-		if (scan.HqThumbCache.Count >= 4096)
-			scan.HqThumbCache.Clear();
-		scan.HqThumbCache.TryAdd(cacheKey, jpeg);
+		await WriteThumbnailPlaceholder(ctx);
+		return;
 	}
 
 	ctx.Response.ContentType = "image/jpeg";
@@ -141,19 +177,28 @@ app.MapGet("/thumbnail/full", async (HttpContext ctx, ScanService scan) => {
 	string? path = ctx.Request.Query["path"];
 	if (string.IsNullOrEmpty(path)) { ctx.Response.StatusCode = 400; return; }
 
-	path = Path.GetFullPath(path);
-	var item = scan.Duplicates.FirstOrDefault(d => d.Path == path);
+	var item = ResultPresentationUtils.FindResultByPath(
+		scan.Duplicates,
+		path,
+		out string normalizedPath);
 	if (item == null) { ctx.Response.StatusCode = 404; return; }
+	path = normalizedPath;
+	int index = int.TryParse(ctx.Request.Query["index"], out int requestedIndex)
+		? requestedIndex
+		: 0;
+	if (!ThumbnailPositionResolver.TryGetPosition(item, scan.Settings, index, out TimeSpan position)) {
+		ctx.Response.StatusCode = 400;
+		return;
+	}
 
-	var position = item.ThumbnailTimestamps.Count > 0
-		? item.ThumbnailTimestamps[0]
-		: TimeSpan.FromSeconds(item.Duration.TotalSeconds * 0.1);
-
-	string cacheKey = $"{path}|{position.TotalSeconds:F2}|full";
+	string cacheKey = $"{path}|frame={index}|{position.TotalSeconds:F2}|full";
 
 	if (!scan.FullThumbCache.TryGetValue(cacheKey, out var jpeg)) {
 		jpeg = await Task.Run(() => ScanEngine.ExtractThumbnailJpeg(path, position, 0));
-		if (jpeg == null || jpeg.Length == 0) { ctx.Response.StatusCode = 204; return; }
+		if (jpeg == null || jpeg.Length == 0) {
+			await WriteThumbnailPlaceholder(ctx);
+			return;
+		}
 		// Full-resolution frames are megabytes each — keep this cache small.
 		if (scan.FullThumbCache.Count >= 64)
 			scan.FullThumbCache.Clear();
@@ -167,6 +212,44 @@ app.MapGet("/thumbnail/full", async (HttpContext ctx, ScanService scan) => {
 
 // CSV export of the current results — same column layout as the GUI export,
 // minus the GUI-only Checked column.
+var contentTypeProvider = new FileExtensionContentTypeProvider();
+app.MapGet("/media/open", Microsoft.AspNetCore.Http.IResult (HttpContext ctx, ScanService scan) => {
+	string? requestedPath = ctx.Request.Query["path"];
+	if (string.IsNullOrWhiteSpace(requestedPath))
+		return Microsoft.AspNetCore.Http.Results.BadRequest();
+	var item = ResultPresentationUtils.FindResultByPath(
+		scan.Duplicates,
+		requestedPath,
+		out string normalizedPath);
+	if (item == null || !File.Exists(normalizedPath))
+		return Microsoft.AspNetCore.Http.Results.NotFound();
+	if (!contentTypeProvider.TryGetContentType(normalizedPath, out string? contentType))
+		contentType = "application/octet-stream";
+	bool safeInlineType =
+		contentType.StartsWith("video/", StringComparison.OrdinalIgnoreCase) ||
+		contentType.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) ||
+		(contentType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) &&
+			!contentType.Equals("image/svg+xml", StringComparison.OrdinalIgnoreCase));
+	ctx.Response.Headers["X-Content-Type-Options"] = "nosniff";
+	if (!safeInlineType)
+		contentType = "application/octet-stream";
+	return Microsoft.AspNetCore.Http.Results.File(
+		normalizedPath,
+		contentType,
+		enableRangeProcessing: true);
+});
+
+app.MapGet("/export/worker-profile", (ScanService scan) => {
+	WorkerProfile profile = WebSettingsService.CreateWorkerProfile(scan.Settings);
+	byte[] json = System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(
+		profile,
+		CoreJsonContext.Default.WorkerProfile);
+	return Microsoft.AspNetCore.Http.Results.File(
+		json,
+		"application/json",
+		"worker-profile.json");
+});
+
 app.MapGet("/export/csv", (ScanService scan) => {
 	static string Escape(string? s) {
 		s ??= string.Empty;
@@ -207,3 +290,14 @@ var ffmpegSetup = app.Services.GetRequiredService<FFmpegSetupService>();
 _ = ffmpegSetup.CheckAndSetupAsync();
 
 app.Run();
+
+static async Task WriteThumbnailPlaceholder(HttpContext ctx) {
+	const string svg =
+		"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"360\" viewBox=\"0 0 640 360\">" +
+		"<rect width=\"640\" height=\"360\" fill=\"#20242b\"/>" +
+		"<text x=\"320\" y=\"185\" text-anchor=\"middle\" fill=\"#9ca3af\" " +
+		"font-family=\"sans-serif\" font-size=\"24\">No preview</text></svg>";
+	ctx.Response.ContentType = "image/svg+xml";
+	ctx.Response.Headers.CacheControl = "no-store";
+	await ctx.Response.WriteAsync(svg);
+}

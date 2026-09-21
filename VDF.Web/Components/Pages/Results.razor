@@ -12,19 +12,16 @@
 @{
     var allDuplicates = Scan.Duplicates;
     var filteredGroups = GetFilteredGroups();
-    long totalSize = 0, potentialSavings = 0;
-    int totalFiles = 0;
-    foreach (var g in filteredGroups) {
-        long groupTotal = 0, largest = 0;
-        foreach (var i in g) {
-            totalFiles++;
-            long s = Math.Max(0, i.SizeLong);
-            groupTotal += s;
-            if (s > largest) largest = s;
-        }
-        totalSize += groupTotal;
-        potentialSavings += groupTotal - largest;
-    }
+    _currentPage = ResultGroupProjection.ClampPage(
+        _currentPage, filteredGroups.Count, _pageSize);
+    var pageGroups = ResultGroupProjection.GetPage(
+        filteredGroups, _currentPage, _pageSize);
+    int pageCount = ResultGroupProjection.GetPageCount(filteredGroups.Count, _pageSize);
+    int firstVisibleGroup = filteredGroups.Count == 0 ? 0 : ((_currentPage - 1) * _pageSize) + 1;
+    int lastVisibleGroup = Math.Min(_currentPage * _pageSize, filteredGroups.Count);
+    long totalSize = filteredGroups.Sum(group => group.TotalSize);
+    long potentialSavings = filteredGroups.Sum(group => group.PotentialSavings);
+    int totalFiles = filteredGroups.Sum(group => group.FileCount);
     long selectedSize = _selected.Sum(i => Math.Max(0, i.SizeLong));
     int renderIndex = 0;
 }
@@ -34,33 +31,89 @@
 }
 else {
     <div class="results-toolbar" @onkeydown="OnKeyDown" tabindex="0">
-        <input class="search-box" @bind="_search" @bind:event="oninput"
+        <input class="search-box" value="@_search" @oninput="OnSearchInput"
                placeholder="Filter by path (* and ? wildcards)..." />
         @if (!string.IsNullOrEmpty(_search)) {
-            <button @onclick="() => _search = string.Empty">&#x2715;</button>
+            <button @onclick="ClearSearch">&#x2715;</button>
         }
+        <div class="result-filter-tabs" aria-label="Similarity filter">
+            <button class="@(_similarityFilter == ResultSimilarityFilter.All ? "active" : "")"
+                    @onclick="() => SetSimilarityFilter(ResultSimilarityFilter.All)">All</button>
+            <button class="@(_similarityFilter == ResultSimilarityFilter.DisplayedHundredPercent ? "active" : "")"
+                    @onclick="() => SetSimilarityFilter(ResultSimilarityFilter.DisplayedHundredPercent)">100.0%</button>
+            <button class="@(_similarityFilter == ResultSimilarityFilter.BelowDisplayedHundredPercent ? "active" : "")"
+                    @onclick="() => SetSimilarityFilter(ResultSimilarityFilter.BelowDisplayedHundredPercent)">Below 100.0%</button>
+        </div>
+        <label class="result-control">
+            Group order
+            <select value="@_groupSort" @onchange="OnGroupSortChanged">
+                <option value="SimilarityDescending">Similarity high to low</option>
+                <option value="SimilarityAscending">Similarity low to high</option>
+            </select>
+        </label>
+        <label class="result-control">
+            Per page
+            <select value="@_pageSize" @onchange="OnPageSizeChanged">
+                <option value="25">25</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+            </select>
+        </label>
         <span class="result-count">
             @filteredGroups.Count group(s), @totalFiles file(s), @FormatSize(totalSize) — potential savings @FormatSize(potentialSavings)
             @if (_selected.Count > 0) { <text> — @_selected.Count selected (@FormatSize(selectedSize))</text> }
         </span>
 
+        @if (_folderFilter != null) {
+            <span class="folder-filter-chip" title="@_folderFilter">
+                Folder: @_folderFilter
+                <button @onclick="ClearFolderFilter" title="Clear folder filter">&#x2715;</button>
+            </span>
+        }
+        @foreach (string directory in _excludedDirectories.OrderBy(path => path)) {
+            <span class="folder-filter-chip excluded" title="@directory">
+                Excluded: @directory
+                <button @onclick="() => RemoveExcludedDirectory(directory)"
+                        title="Remove directory exclusion">&#x2715;</button>
+            </span>
+        }
+        @if (_excludedDirectories.Count > 1) {
+            <button @onclick="ClearExcludedDirectories">Clear exclusions</button>
+        }
+
         @* Auto-select dropdown *@
         <div class="dropdown-wrap">
-            <button @onclick="() => _autoSelectOpen = !_autoSelectOpen">Select &#x25BE;</button>
+            <button @onclick="() => _autoSelectOpen = !_autoSelectOpen"
+                    title="Choose whether selection applies to this page or all filtered pages">Select &#x25BE;</button>
             @if (_autoSelectOpen) {
                 <div class="dropdown-overlay" @onclick="() => _autoSelectOpen = false"></div>
                 <div class="dropdown-menu">
-                    <button @onclick="() => AutoSelect(AutoSelectMode.LowestQuality)">Lowest quality</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.SmallestFile)">Smallest file</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.Oldest)">Oldest (keep newest)</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.Newest)">Newest (keep oldest)</button>
-                    <button @onclick="() => AutoSelect(AutoSelectMode.HundredPercentEqual)">100% equal groups</button>
+                    <div class="dropdown-section-title">This page</div>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.LowestQuality, AutoSelectScope.CurrentPage)">Lowest quality</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.SmallestFile, AutoSelectScope.CurrentPage)">Smallest file</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepNewestCreated, AutoSelectScope.CurrentPage)">Keep newest created</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepOldestCreated, AutoSelectScope.CurrentPage)">Keep oldest created</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepNewestModified, AutoSelectScope.CurrentPage)">Keep newest modified</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepOldestModified, AutoSelectScope.CurrentPage)">Keep oldest modified</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.HundredPercentEqual, AutoSelectScope.CurrentPage)">100.0% groups</button>
+                    <button @onclick="() => InvertSelection(AutoSelectScope.CurrentPage)">Invert page selection</button>
                     <hr />
-                    <button @onclick="InvertSelection">Invert selection</button>
+                    <div class="dropdown-section-title">All filtered pages</div>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.LowestQuality, AutoSelectScope.AllFiltered)">Lowest quality</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.SmallestFile, AutoSelectScope.AllFiltered)">Smallest file</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepNewestCreated, AutoSelectScope.AllFiltered)">Keep newest created</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepOldestCreated, AutoSelectScope.AllFiltered)">Keep oldest created</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepNewestModified, AutoSelectScope.AllFiltered)">Keep newest modified</button>
+                    <button @onclick="() => ApplyRule(ResultSelectionRule.KeepOldestModified, AutoSelectScope.AllFiltered)">Keep oldest modified</button>
+                    <button @onclick="() => AutoSelect(AutoSelectMode.HundredPercentEqual, AutoSelectScope.AllFiltered)">100.0% groups</button>
+                    <button @onclick="() => InvertSelection(AutoSelectScope.AllFiltered)">Invert filtered selection</button>
+                    <hr />
                     <button @onclick="ClearSelection">Deselect all</button>
                 </div>
             }
         </div>
+
+        <button @onclick="() => _rulesOpen = !_rulesOpen" aria-expanded="@_rulesOpen">Rules (@Scan.ProtectedResultDirectories.Count protected folders)</button>
 
         @* Collapse all / Expand all *@
         <button @onclick="CollapseAll" title="Collapse all groups">Collapse all</button>
@@ -77,6 +130,56 @@ else {
                 <button @onclick="ClearSelection">Deselect all</button>
             </div>
         }
+    </div>
+
+    @if (_rulesOpen) {
+        <section class="result-rules-panel" aria-label="Selection rules">
+            <h2>Selection rules</h2>
+            <p>Checked files are marked for deletion. Protected folders include all subfolders and override every selection rule.</p>
+            <div class="result-rules-controls">
+                <label>Protected folder (absolute server path)
+                    <input @bind="_protectedFolderInput" placeholder="Absolute folder path" />
+                </label>
+                <button @onclick="AddProtectedFolder" disabled="@Scan.FileOpRunning">Add folder</button>
+            </div>
+            <div class="result-rules-folders">
+                @foreach (string directory in Scan.ProtectedResultDirectories.OrderBy(path => path)) {
+                    <span class="folder-filter-chip" title="@directory">
+                        Protected: @directory
+                        <button @onclick="() => RemoveProtectedFolder(directory)" disabled="@Scan.FileOpRunning" title="Remove protection">&#x2715;</button>
+                    </span>
+                }
+            </div>
+            <div class="result-rules-controls">
+                <label>Keep rule
+                    <select @bind="_selectionRule">
+                        <option value="KeepProtectedFolders">Keep all files in protected folders</option>
+                        <option value="KeepNewestCreated">Keep newest creation date</option>
+                        <option value="KeepOldestCreated">Keep oldest creation date</option>
+                        <option value="KeepNewestModified">Keep newest modification date</option>
+                        <option value="KeepOldestModified">Keep oldest modification date</option>
+                    </select>
+                </label>
+                <label>Apply to
+                    <select @bind="_ruleScope">
+                        <option value="AllFiltered">All filtered pages</option>
+                        <option value="CurrentPage">This page</option>
+                    </select>
+                </label>
+                <button class="primary" @onclick="() => ApplyRule(_selectionRule, _ruleScope)"
+                        disabled="@(Scan.FileOpRunning || (_selectionRule == ResultSelectionRule.KeepProtectedFolders && Scan.ProtectedResultDirectories.Count == 0))">Apply rule</button>
+            </div>
+            <p>Replaces selections in the chosen scope; selections outside that scope remain. Dates are compared within each complete duplicate group; tied dates are kept. Groups with missing dates are skipped (rescan to populate dates). The folder rule skips groups without a protected file. Use Delete after reviewing the selection.</p>
+        </section>
+    }
+
+    <div class="results-pagination" aria-label="Results pages">
+        <span>Showing groups @firstVisibleGroup–@lastVisibleGroup</span>
+        <button @onclick="() => GoToPage(1)" disabled="@(_currentPage <= 1)">First</button>
+        <button @onclick="() => GoToPage(_currentPage - 1)" disabled="@(_currentPage <= 1)">Previous</button>
+        <strong>Page @_currentPage / @pageCount</strong>
+        <button @onclick="() => GoToPage(_currentPage + 1)" disabled="@(_currentPage >= pageCount)">Next</button>
+        <button @onclick="() => GoToPage(pageCount)" disabled="@(_currentPage >= pageCount)">Last</button>
     </div>
 
     @* Batch file operation progress *@
@@ -128,13 +231,16 @@ else {
         <div class="@(_operationFailed ? "error-box" : "info-box")">@_operationMsg</div>
     }
 
-    @foreach (var group in filteredGroups) {
-        var groupId = group.Key;
-        var sortedItems = SortItems(group.ToList());
+    @foreach (var group in pageGroups) {
+        var groupId = group.GroupId;
+        var sortedItems = SortItems(group.Items.ToList());
         bool allGroupSelected = sortedItems.All(i => _selected.Contains(i));
         bool isCollapsed = _collapsedGroups.Contains(groupId);
-        float maxSimilarity = sortedItems.Max(i => i.Similarity);
-        long groupSize = sortedItems.Sum(i => Math.Max(0, i.SizeLong));
+        float groupSimilarity = group.MinimumSimilarity;
+        string groupSimilarityText = ResultPresentationUtils.FormatGroupSimilarity(sortedItems);
+        int thumbnailCount = ThumbnailPositionResolver.GetFrameCount(sortedItems[0], Scan.Settings);
+        int thumbnailIndex = Math.Clamp(_groupThumbnailIndices.GetValueOrDefault(groupId), 0, thumbnailCount - 1);
+        long groupSize = group.TotalSize;
         int groupIndex = renderIndex++;
         int hiddenCount = sortedItems.Count(i => _hiddenItems.Contains(i.Path));
         var hoveredMetric = _hoveredMetrics.GetValueOrDefault(groupId);
@@ -146,10 +252,18 @@ else {
                            @onchange="() => ToggleGroup(sortedItems, !allGroupSelected)" />
                     @sortedItems.Count file(s) &#183; @FormatSize(groupSize)
                 </label>
-                <span class="similarity-badge @SimilarityClass(maxSimilarity)">
-                    @maxSimilarity.ToString("F1")% similar
+                <span class="similarity-badge @SimilarityClass(groupSimilarity)"
+                      title="Range of member match scores; Reference items are excluded">
+                    @groupSimilarityText
                 </span>
                 <div class="group-actions">
+                    @if (thumbnailCount > 1) {
+                        <button @onclick="() => ChangeGroupThumbnail(groupId, thumbnailCount, -1)"
+                                title="Previous synchronized thumbnail">&#x276E;</button>
+                        <span class="thumbnail-counter">@(thumbnailIndex + 1)/@thumbnailCount</span>
+                        <button @onclick="() => ChangeGroupThumbnail(groupId, thumbnailCount, 1)"
+                                title="Next synchronized thumbnail">&#x276F;</button>
+                    }
                     <select class="group-sort" title="Sort cards"
                             @onchange="e => SetGroupSort(groupId, e.Value?.ToString())">
                         <option value="" selected="@(!_groupSorts.ContainsKey(groupId))">Sort by…</option>
@@ -175,6 +289,7 @@ else {
                         if (_hiddenItems.Contains(item.Path)) continue;
                         bool sel = _selected.Contains(item);
                         bool isBest = item.IsBestBitRateKbs || item.IsBestFrameSize;
+                        bool isSimilarityReference = ResultPresentationUtils.IsSimilarityReference(item, sortedItems);
 
                         <div class="dup-card @(isBest ? "best" : "") @(sel ? "selected" : "")"
                              @key="item.Path"
@@ -184,8 +299,9 @@ else {
 
                             <div class="card-top-bar" @onclick:stopPropagation>
                                 <label class="card-check">
-                                    <input type="checkbox" checked="@sel"
+                                    <input type="checkbox" checked="@sel" disabled="@IsProtected(item)"
                                            @onchange="() => ToggleItem(item)" />
+                                    @if (IsProtected(item)) { <span class="protected-file-badge">Protected</span> }
                                 </label>
                                 <div style="display:flex;gap:0.2rem;">
                                     <button class="card-hide" @onclick="() => HideItem(item.Path)" title="Hide card">&#x1F441;</button>
@@ -196,14 +312,17 @@ else {
                             <div class="card-thumb" @onclick:stopPropagation>
                                 @if (WebSettings.AutoLoadThumbnails) {
                                     <div class="thumb-skeleton"></div>
-                                    <img data-src="/thumbnail/hq?path=@Uri.EscapeDataString(item.Path)&amp;w=@WebSettings.ThumbnailWidth&amp;q=@WebSettings.ThumbnailJpegQuality"
+                                    <img @key="(item.Path, thumbnailIndex)"
+                                         data-src="/thumbnail/hq?path=@Uri.EscapeDataString(item.Path)&amp;index=@thumbnailIndex&amp;w=@WebSettings.ThumbnailWidth&amp;q=@WebSettings.ThumbnailJpegQuality"
                                          alt="thumbnail"
                                          onerror="this.style.display='none'" />
                                 }
                                 else {
                                     <div class="thumb-placeholder">No preview</div>
                                 }
-                                <span class="similarity-overlay">@item.Similarity.ToString("F1")%</span>
+                                <span class="similarity-overlay" title="@SimilarityTitle(item, isSimilarityReference)">
+                                    @(isSimilarityReference ? "Reference" : $"{item.Similarity:F1}%")
+                                </span>
                             </div>
 
                             <div class="card-body">
@@ -284,6 +403,11 @@ else {
                                     </div>
                                 </div>
 
+                                <div class="card-dates">
+                                    <div title="Creation date recorded by the scan">Created: @FormatRuleDate(item.DateCreated)</div>
+                                    <div title="Modification date recorded by the scan">Modified: @FormatRuleDate(item.DateModified)</div>
+                                </div>
+
                                 <div class="card-badges">
                                     @if (isBest) {
                                         <span class="badge-best">Best quality</span>
@@ -305,15 +429,35 @@ else {
             }
         </div>
     }
+
+    <div class="results-pagination bottom" aria-label="Results pages">
+        <span>Showing groups @firstVisibleGroup–@lastVisibleGroup</span>
+        <button @onclick="() => GoToPage(1)" disabled="@(_currentPage <= 1)">First</button>
+        <button @onclick="() => GoToPage(_currentPage - 1)" disabled="@(_currentPage <= 1)">Previous</button>
+        <strong>Page @_currentPage / @pageCount</strong>
+        <button @onclick="() => GoToPage(_currentPage + 1)" disabled="@(_currentPage >= pageCount)">Next</button>
+        <button @onclick="() => GoToPage(pageCount)" disabled="@(_currentPage >= pageCount)">Last</button>
+    </div>
 }
 
 @* Fullsize comparison modal *@
 @if (_compareVisible && _compareItems != null && _compareItems.Count >= 2) {
     var itemA = _compareItems[_compareA];
     var itemB = _compareItems[_compareB];
+    int compareThumbnailCount = Math.Min(
+        ThumbnailPositionResolver.GetFrameCount(itemA, Scan.Settings),
+        ThumbnailPositionResolver.GetFrameCount(itemB, Scan.Settings));
+    int compareThumbnailIndex = Math.Clamp(_compareThumbnailIndex, 0, compareThumbnailCount - 1);
     <div class="compare-overlay active" id="compare-modal">
         <div class="compare-header">
             <h3>Compare</h3>
+            @if (compareThumbnailCount > 1) {
+                <div class="compare-frame-controls">
+                    <button @onclick="() => ChangeCompareThumbnail(compareThumbnailCount, -1)">&#x276E;</button>
+                    <span>@(compareThumbnailIndex + 1)/@compareThumbnailCount</span>
+                    <button @onclick="() => ChangeCompareThumbnail(compareThumbnailCount, 1)">&#x276F;</button>
+                </div>
+            }
             <button class="compare-close" @onclick="CloseCompare">&#x2715;</button>
         </div>
         <div class="compare-mode-tabs">
@@ -327,7 +471,7 @@ else {
                 string cls = idx == _compareA ? "active-a" : idx == _compareB ? "active-b" : "";
                 <div class="compare-selector-item @cls"
                      @onclick="() => SelectCompareItem(idx)">
-                    <img src="/thumbnail/hq?path=@Uri.EscapeDataString(ci.Path)" alt="" />
+                    <img src="/thumbnail/hq?path=@Uri.EscapeDataString(ci.Path)&amp;index=@compareThumbnailIndex" alt="" />
                     <div class="sel-label">@System.IO.Path.GetFileName(ci.Path)</div>
                 </div>
             }
@@ -337,7 +481,7 @@ else {
                 <div class="compare-side-by-side">
                     <div class="compare-pane">
                         <div class="compare-pane-img">
-                            <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemA.Path)" alt="A" />
+                            <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemA.Path)&amp;index=@compareThumbnailIndex" alt="A" />
                         </div>
                         <div class="compare-pane-info">
                             <div class="compare-pane-label">@System.IO.Path.GetFileName(itemA.Path)</div>
@@ -347,7 +491,7 @@ else {
                     <div class="compare-pane-divider"></div>
                     <div class="compare-pane">
                         <div class="compare-pane-img">
-                            <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemB.Path)" alt="B" />
+                            <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemB.Path)&amp;index=@compareThumbnailIndex" alt="B" />
                         </div>
                         <div class="compare-pane-info">
                             <div class="compare-pane-label">@System.IO.Path.GetFileName(itemB.Path)</div>
@@ -359,10 +503,10 @@ else {
             else {
                 <div class="compare-swipe" style="--swipe-pos: 50%">
                     <div class="compare-swipe-img-a">
-                        <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemA.Path)" alt="A" />
+                        <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemA.Path)&amp;index=@compareThumbnailIndex" alt="A" />
                     </div>
                     <div class="compare-swipe-img-b">
-                        <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemB.Path)" alt="B" />
+                        <img src="/thumbnail/full?path=@Uri.EscapeDataString(itemB.Path)&amp;index=@compareThumbnailIndex" alt="B" />
                     </div>
                     <div class="compare-swipe-line"></div>
                     <div class="compare-swipe-handle">&#x2194;</div>
@@ -378,11 +522,16 @@ else {
 @if (_menuVisible && _menuItem != null) {
     <div class="ctx-overlay" @onclick="HideContextMenu"></div>
     <div class="ctx-menu" style="left:@(_menuX.ToString("F0"))px;top:@(_menuY.ToString("F0"))px">
-        <button @onclick="() => OpenFile(_menuItem)">Open file</button>
-        <button @onclick="() => OpenFolder(_menuItem)">Open folder</button>
+        <a class="ctx-menu-action"
+           href="/media/open?path=@Uri.EscapeDataString(_menuItem.Path)"
+           target="_blank"
+           rel="noopener noreferrer"
+           @onclick="HideContextMenu">Open file in browser</a>
+        <button @onclick="() => ShowFolder(_menuItem)">Show this folder</button>
+        <button @onclick="() => ExcludeFolder(_menuItem)">Exclude this folder</button>
         <button @onclick="() => CopyPath(_menuItem)">Copy path</button>
         <hr />
-        <button @onclick="() => { ToggleItem(_menuItem); HideContextMenu(); }">
+        <button @onclick="() => { ToggleItem(_menuItem); HideContextMenu(); }" disabled="@IsProtected(_menuItem)">
             @(_selected.Contains(_menuItem) ? "Deselect" : "Select")
         </button>
         @if (_menuGroup != null) {
@@ -399,7 +548,18 @@ else {
 
 @code {
     string _search = string.Empty;
+    IReadOnlyList<ResultGroupView> _allGroupViews = Array.Empty<ResultGroupView>();
+    IReadOnlyList<ResultGroupView> _filteredGroupViews = Array.Empty<ResultGroupView>();
+    long _groupViewRevision = -1;
+    bool _filteredGroupsDirty = true;
+    ResultSimilarityFilter _similarityFilter = ResultSimilarityFilter.All;
+    ResultGroupSort _groupSort = ResultGroupSort.SimilarityDescending;
+    int _pageSize = 50;
+    int _currentPage = 1;
+    bool _scrollToFirstGroupAfterRender;
     readonly HashSet<DuplicateItem> _selected = new();
+    readonly HashSet<string> _excludedDirectories =
+        new(VDF.Core.Utils.PathComparer.ForCurrentPlatform);
     bool _confirmDelete;
     bool _confirmDeletePermanent;
     bool _showMovePanel;
@@ -417,12 +577,18 @@ else {
 
     // Auto-select dropdown
     bool _autoSelectOpen;
+    bool _rulesOpen;
+    string _protectedFolderInput = string.Empty;
+    ResultSelectionRule _selectionRule = ResultSelectionRule.KeepProtectedFolders;
+    AutoSelectScope _ruleScope = AutoSelectScope.AllFiltered;
 
     // QoL state
     readonly HashSet<Guid> _collapsedGroups = new();
     readonly HashSet<string> _hiddenItems = new();
     readonly Dictionary<Guid, string> _hoveredMetrics = new();
     readonly Dictionary<Guid, string> _groupSorts = new();
+    readonly Dictionary<Guid, int> _groupThumbnailIndices = new();
+    string? _folderFilter;
     int _focusedGroup = -1;
 
     // Comparison modal
@@ -430,6 +596,7 @@ else {
     List<DuplicateItem>? _compareItems;
     int _compareA;
     int _compareB = 1;
+    int _compareThumbnailIndex;
     CompareMode _compareMode = CompareMode.SideBySide;
     bool _compareSelectingB;
 
@@ -442,10 +609,13 @@ else {
     const string MetricFps = "fps";
     const string MetricSize = "size";
 
-    enum AutoSelectMode { LowestQuality, SmallestFile, Oldest, Newest, HundredPercentEqual }
+    enum AutoSelectMode { LowestQuality, SmallestFile, HundredPercentEqual }
+    enum AutoSelectScope { CurrentPage, AllFiltered }
 
-    protected override void OnInitialized() =>
+    protected override void OnInitialized() {
         Scan.StateChanged += OnStateChanged;
+        SyncReviewStateFromService();
+    }
 
     protected override async Task OnAfterRenderAsync(bool firstRender) {
         try {
@@ -458,6 +628,10 @@ else {
                 }
             }
             await JS.InvokeVoidAsync("vdf.initLazyThumbs");
+            if (_scrollToFirstGroupAfterRender) {
+                _scrollToFirstGroupAfterRender = false;
+                await JS.InvokeVoidAsync("vdf.scrollToGroup", 0);
+            }
             if (_compareVisible && _compareMode == CompareMode.Swipe)
                 await JS.InvokeVoidAsync("vdf.initSwipe");
         }
@@ -469,10 +643,75 @@ else {
         catch { }
     }
 
+    void SyncReviewStateFromService(
+        IReadOnlyCollection<DuplicateItem>? items = null) {
+        items ??= Scan.Duplicates.ToList();
+        _excludedDirectories.Clear();
+        foreach (string directory in Scan.ExcludedResultDirectories)
+            _excludedDirectories.Add(directory);
+
+        var selectedPaths = new HashSet<string>(
+            Scan.SelectedResultPaths,
+            VDF.Core.Utils.PathComparer.ForCurrentPlatform);
+        _selected.Clear();
+        foreach (DuplicateItem item in items)
+            if (selectedPaths.Contains(item.Path) && !IsProtected(item) &&
+                !_excludedDirectories.Any(directory =>
+                    ResultPresentationUtils.IsInDirectory(item.Path, directory)))
+                _selected.Add(item);
+        _filteredGroupsDirty = true;
+    }
+
+    void PersistReviewState() {
+        _selected.RemoveWhere(IsProtected);
+        Scan.UpdateResultReviewState(
+            _selected.Select(item => item.Path),
+            _excludedDirectories);
+    }
+
+    bool IsProtected(DuplicateItem item) => Scan.IsResultProtected(item.Path);
+
+    static string FormatRuleDate(DateTime? date) => date is null || date == DateTime.MinValue
+        ? "Unknown" : date.Value.ToString("yyyy-MM-dd HH:mm:ss") + (date.Value.Kind == DateTimeKind.Utc ? " UTC" : "");
+
+    void AddProtectedFolder() {
+        try {
+            string directory = ResultSelectionRules.NormalizeDirectory(_protectedFolderInput);
+            Scan.UpdateProtectedResultDirectories(Scan.ProtectedResultDirectories.Append(directory));
+            _protectedFolderInput = string.Empty;
+            _selected.RemoveWhere(IsProtected);
+            _confirmDelete = _confirmDeletePermanent = false;
+        }
+        catch (Exception ex) { ShowMsg(ex.Message, true); }
+    }
+
+    void RemoveProtectedFolder(string directory) {
+        try {
+            Scan.UpdateProtectedResultDirectories(Scan.ProtectedResultDirectories.Where(path => path != directory));
+            _confirmDelete = _confirmDeletePermanent = false;
+        }
+        catch (Exception ex) { ShowMsg(ex.Message, true); }
+    }
+
+    void ApplyRule(ResultSelectionRule rule, AutoSelectScope scope) {
+        if (Scan.FileOpRunning) return;
+        _autoSelectOpen = false;
+        var scopedItems = GetSelectionScope(scope).SelectMany(group => group.Items).ToHashSet();
+        var candidates = ResultSelectionRules.SelectForDeletion(
+            Scan.Duplicates, scopedItems, Scan.ProtectedResultDirectories, rule);
+        _selected.ExceptWith(scopedItems);
+        _selected.UnionWith(candidates);
+        _confirmDelete = _confirmDeletePermanent = false;
+        PersistReviewState();
+        ShowMsg($"Rule applied: {candidates.Count} file(s) selected for deletion in this scope. Review the selection, then use Delete.", false);
+    }
+
     // === Selection ===
     void ToggleItem(DuplicateItem item) {
+        if (IsProtected(item)) return;
         if (!_selected.Remove(item))
             _selected.Add(item);
+        PersistReviewState();
     }
 
     void ToggleGroup(IEnumerable<DuplicateItem> items, bool select) {
@@ -480,25 +719,34 @@ else {
             if (select) _selected.Add(item);
             else _selected.Remove(item);
         }
+        PersistReviewState();
     }
 
-    void InvertSelection() {
+    void InvertSelection(AutoSelectScope scope) {
         _autoSelectOpen = false;
-        foreach (var item in Scan.Duplicates.ToList()) {
+        var scopedItems = GetSelectionScope(scope)
+            .SelectMany(group => group.Items)
+            .Distinct()
+            .ToList();
+        foreach (var item in scopedItems) {
             if (!_selected.Remove(item))
                 _selected.Add(item);
         }
+        PersistReviewState();
     }
 
     void ClearSelection() {
         _autoSelectOpen = false;
         _selected.Clear();
+        PersistReviewState();
     }
 
     // === Remove / Delete / Move ===
     void RemoveSelected() {
-        Scan.RemoveFromResults(_selected.ToList());
+        var selected = _selected.ToList();
         _selected.Clear();
+        PersistReviewState();
+        Scan.RemoveFromResults(selected);
         ShowMsg("Removed from results list.", false);
     }
 
@@ -506,30 +754,34 @@ else {
         HideContextMenu();
         Scan.RemoveFromResults(new List<DuplicateItem> { item });
         _selected.Remove(item);
+        PersistReviewState();
     }
 
     async Task ExecuteDelete(bool permanent) {
         _confirmDelete = false;
         _confirmDeletePermanent = false;
-        var toDelete = _selected.ToList();
-        _selected.Clear();
+        var toDelete = _selected.Where(item => !IsProtected(item)).ToList();
         var result = await Scan.DeleteItemsAsync(toDelete, permanent);
+        _selected.RemoveWhere(item => !Scan.Duplicates.Contains(item));
+        PersistReviewState();
         ShowOpResult($"{result.Done} file(s) {(permanent ? "permanently deleted" : "moved to trash")}", result);
     }
 
     async Task MoveSelected() {
         _showMovePanel = false;
         var toMove = _selected.ToList();
-        _selected.Clear();
         var result = await Scan.MoveItemsAsync(toMove, _moveDestination);
+        _selected.RemoveWhere(item => !Scan.Duplicates.Contains(item));
+        PersistReviewState();
         ShowOpResult($"{result.Done} file(s) moved to '{_moveDestination}'", result);
     }
 
     async Task CreateLinksSelected() {
         _showLinkPanel = false;
         var toLink = _selected.ToList();
-        _selected.Clear();
         var result = await Scan.CreateLinksAsync(toLink, _linkHard);
+        _selected.RemoveWhere(item => !Scan.Duplicates.Contains(item));
+        PersistReviewState();
         ShowOpResult($"{result.Done} file(s) replaced with {(_linkHard ? "hardlinks" : "symlinks")}", result);
     }
 
@@ -566,24 +818,60 @@ else {
         _menuGroup = null;
     }
 
-    void OpenFile(DuplicateItem item) {
-        HideContextMenu();
-        try {
-            System.Diagnostics.Process.Start(
-                new System.Diagnostics.ProcessStartInfo(item.Path) { UseShellExecute = true });
-        }
-        catch { }
-    }
-
-    void OpenFolder(DuplicateItem item) {
+    void ShowFolder(DuplicateItem item) {
         HideContextMenu();
         try {
             var dir = Path.GetDirectoryName(item.Path);
-            if (dir != null)
-                System.Diagnostics.Process.Start(
-                    new System.Diagnostics.ProcessStartInfo(dir) { UseShellExecute = true });
+            if (dir != null) {
+                _folderFilter = Path.TrimEndingDirectorySeparator(Path.GetFullPath(dir));
+                InvalidateFilteredGroups();
+            }
         }
-        catch { }
+        catch (Exception ex) {
+            ShowMsg($"Could not filter folder: {ex.Message}", true);
+        }
+    }
+
+    void ClearFolderFilter() {
+        _folderFilter = null;
+        InvalidateFilteredGroups();
+    }
+
+    void ExcludeFolder(DuplicateItem item) {
+        HideContextMenu();
+        try {
+            string? directory = Path.GetDirectoryName(item.Path);
+            if (directory == null)
+                return;
+            string normalized = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(directory));
+            if (_excludedDirectories.Add(normalized)) {
+                _selected.RemoveWhere(selected =>
+                    ResultPresentationUtils.IsInDirectory(
+                        selected.Path,
+                        normalized));
+                InvalidateFilteredGroups();
+                PersistReviewState();
+            }
+        }
+        catch (Exception ex) {
+            ShowMsg($"Could not exclude folder: {ex.Message}", true);
+        }
+    }
+
+    void RemoveExcludedDirectory(string directory) {
+        if (_excludedDirectories.Remove(directory)) {
+            InvalidateFilteredGroups();
+            PersistReviewState();
+        }
+    }
+
+    void ClearExcludedDirectories() {
+        if (_excludedDirectories.Count == 0)
+            return;
+        _excludedDirectories.Clear();
+        InvalidateFilteredGroups();
+        PersistReviewState();
     }
 
     async Task CopyPath(DuplicateItem item) {
@@ -620,6 +908,7 @@ else {
         _compareItems = items;
         _compareA = 0;
         _compareB = Math.Min(1, items.Count - 1);
+        _compareThumbnailIndex = 0;
         _compareSelectingB = false;
         _compareVisible = true;
     }
@@ -644,6 +933,26 @@ else {
             _compareA = idx;
         }
         _compareSelectingB = !_compareSelectingB;
+        _compareThumbnailIndex = 0;
+    }
+
+    void ChangeGroupThumbnail(Guid groupId, int count, int delta) {
+        if (count <= 1) return;
+        int current = Math.Clamp(_groupThumbnailIndices.GetValueOrDefault(groupId), 0, count - 1);
+        _groupThumbnailIndices[groupId] = (current + delta + count) % count;
+    }
+
+    void ChangeCompareThumbnail(int count, int delta) {
+        if (count <= 1) return;
+        _compareThumbnailIndex = (_compareThumbnailIndex + delta + count) % count;
+    }
+
+    static string SimilarityTitle(DuplicateItem item, bool isReference) {
+        if (isReference)
+            return "Reference source for this partial-clip group";
+        if (!string.IsNullOrWhiteSpace(item.SimilarityReferencePath))
+            return $"Compared with {Path.GetFileName(item.SimilarityReferencePath)}";
+        return "Comparison reference unavailable (legacy result)";
     }
 
     // === QoL: Keep Best ===
@@ -653,6 +962,7 @@ else {
         foreach (var item in items)
             if (item.Path != keeper.Path)
                 _selected.Add(item);
+        PersistReviewState();
     }
 
     // === QoL: Sort Within Group ===
@@ -736,21 +1046,88 @@ else {
     static string SimilarityClass(float sim) => sim >= 99f ? "high" : sim >= 90f ? "medium" : "low";
 
     // === Filtering ===
-    List<IGrouping<Guid, DuplicateItem>> GetFilteredGroups() =>
-        Scan.Duplicates
-            .GroupBy(d => d.GroupId)
-            .Where(g => string.IsNullOrEmpty(_search) || g.Any(i => PathMatchesFilter(i.Path, _search)))
-            .OrderBy(g => g.Key)
-            .ToList();
+    void EnsureGroupViewsCurrent() {
+        long revision = Scan.ResultsRevision;
+        if (_groupViewRevision == revision)
+            return;
 
-    // Substring match by default; * and ? switch to wildcard matching (same rules as the GUI filter).
-    static bool PathMatchesFilter(string path, string needle) {
-        if (needle.IndexOfAny(['*', '?']) < 0)
-            return path.Contains(needle, StringComparison.OrdinalIgnoreCase);
-        string pattern = needle;
-        if (!pattern.StartsWith('*')) pattern = "*" + pattern;
-        if (!pattern.EndsWith('*')) pattern += "*";
-        return System.IO.Enumeration.FileSystemName.MatchesSimpleExpression(pattern, path);
+        var snapshot = Scan.Duplicates.ToList();
+        _allGroupViews = ResultGroupProjection.Build(snapshot);
+        _groupViewRevision = revision;
+        _filteredGroupsDirty = true;
+        SyncReviewStateFromService(snapshot);
+    }
+
+    IReadOnlyList<ResultGroupView> GetFilteredGroups() {
+        EnsureGroupViewsCurrent();
+        if (_filteredGroupsDirty) {
+            _filteredGroupViews = ResultGroupProjection.FilterAndSort(
+                _allGroupViews,
+                _search,
+                _folderFilter,
+                _similarityFilter,
+                _groupSort,
+                _excludedDirectories);
+            _currentPage = ResultGroupProjection.ClampPage(
+                _currentPage, _filteredGroupViews.Count, _pageSize);
+            _filteredGroupsDirty = false;
+        }
+        return _filteredGroupViews;
+    }
+
+    IReadOnlyList<ResultGroupView> GetCurrentPageGroups() {
+        var groups = GetFilteredGroups();
+        return ResultGroupProjection.GetPage(groups, _currentPage, _pageSize);
+    }
+
+    void InvalidateFilteredGroups(bool resetPage = true) {
+        _filteredGroupsDirty = true;
+        if (resetPage) {
+            _currentPage = 1;
+            _focusedGroup = 0;
+        }
+    }
+
+    void OnSearchInput(ChangeEventArgs e) {
+        _search = e.Value?.ToString() ?? string.Empty;
+        InvalidateFilteredGroups();
+    }
+
+    void ClearSearch() {
+        _search = string.Empty;
+        InvalidateFilteredGroups();
+    }
+
+    void SetSimilarityFilter(ResultSimilarityFilter filter) {
+        if (_similarityFilter == filter)
+            return;
+        _similarityFilter = filter;
+        InvalidateFilteredGroups();
+    }
+
+    void OnGroupSortChanged(ChangeEventArgs e) {
+        if (Enum.TryParse(e.Value?.ToString(), out ResultGroupSort sort)) {
+            _groupSort = sort;
+            InvalidateFilteredGroups();
+        }
+    }
+
+    void OnPageSizeChanged(ChangeEventArgs e) {
+        if (int.TryParse(e.Value?.ToString(), out int pageSize) &&
+            pageSize is 25 or 50 or 100) {
+            _pageSize = pageSize;
+            InvalidateFilteredGroups();
+        }
+    }
+
+    void GoToPage(int page) {
+        var groups = GetFilteredGroups();
+        int nextPage = ResultGroupProjection.ClampPage(page, groups.Count, _pageSize);
+        if (_currentPage == nextPage)
+            return;
+        _currentPage = nextPage;
+        _focusedGroup = 0;
+        _scrollToFirstGroupAfterRender = true;
     }
 
     // === CSV Export ===
@@ -762,7 +1139,7 @@ else {
     // === QoL: Keyboard Navigation ===
     async Task OnKeyDown(KeyboardEventArgs e) {
         // Same group list the page renders, so j/k/x/1-9 act on what the user sees.
-        var groups = GetFilteredGroups();
+        var groups = GetCurrentPageGroups();
         if (groups.Count == 0) return;
 
         switch (e.Key) {
@@ -776,7 +1153,7 @@ else {
                 break;
             case "x" or "X":
                 if (_focusedGroup >= 0 && _focusedGroup < groups.Count) {
-                    var items = groups[_focusedGroup].ToList();
+                    var items = groups[_focusedGroup].Items.ToList();
                     KeepBest(items);
                 }
                 break;
@@ -786,7 +1163,7 @@ else {
             default:
                 if (int.TryParse(e.Key, out int num) && num >= 1 && num <= 9) {
                     if (_focusedGroup >= 0 && _focusedGroup < groups.Count) {
-                        var items = groups[_focusedGroup].ToList();
+                        var items = groups[_focusedGroup].Items.ToList();
                         if (num <= items.Count)
                             ToggleItem(items[num - 1]);
                     }
@@ -796,41 +1173,46 @@ else {
     }
 
     // === Auto-select ===
-    void AutoSelect(AutoSelectMode mode) {
+    IReadOnlyList<ResultGroupView> GetSelectionScope(AutoSelectScope scope) =>
+        scope == AutoSelectScope.CurrentPage
+            ? GetCurrentPageGroups()
+            : GetFilteredGroups();
+
+    void AutoSelect(AutoSelectMode mode, AutoSelectScope scope) {
         _autoSelectOpen = false;
-        var all = Scan.Duplicates;
-        var processed = new HashSet<Guid>();
+        IReadOnlyList<ResultGroupView> scopedGroups = GetSelectionScope(scope);
 
         if (mode == AutoSelectMode.HundredPercentEqual) {
-            foreach (var grp in all.GroupBy(d => d.GroupId)) {
-                var items = grp.ToList();
-                if (items.All(i => i.Similarity >= 100f)) {
-                    for (int i = 1; i < items.Count; i++)
-                        _selected.Add(items[i]);
-                }
+            foreach (ResultGroupView group in scopedGroups) {
+                if (!group.IsDisplayedHundredPercent)
+                    continue;
+                DuplicateItem keeper = group.Items.FirstOrDefault(item =>
+                    ResultPresentationUtils.IsSimilarityReference(item, group.Items))
+                    ?? group.Items[0];
+                foreach (DuplicateItem item in group.Items)
+                    if (!ReferenceEquals(item, keeper))
+                        _selected.Add(item);
             }
+            PersistReviewState();
             return;
         }
 
-        foreach (var first in all) {
-            if (processed.Contains(first.GroupId)) continue;
-            var groupItems = all.Where(d => d.GroupId == first.GroupId).ToList();
-            if (groupItems.Count < 2) { processed.Add(first.GroupId); continue; }
+        foreach (ResultGroupView group in scopedGroups) {
+            var groupItems = group.Items.ToList();
+            if (groupItems.Count < 2)
+                continue;
 
             DuplicateItem keeper = mode switch {
                 AutoSelectMode.LowestQuality => PickHighestQuality(groupItems),
                 AutoSelectMode.SmallestFile  => groupItems.OrderByDescending(d => d.SizeLong).First(),
-                AutoSelectMode.Oldest        => groupItems.OrderByDescending(d => d.DateCreated).First(),
-                AutoSelectMode.Newest        => groupItems.OrderBy(d => d.DateCreated).First(),
                 _                            => groupItems[0]
             };
 
             foreach (var item in groupItems)
                 if (item.Path != keeper.Path)
                     _selected.Add(item);
-
-            processed.Add(first.GroupId);
         }
+        PersistReviewState();
     }
 
     static readonly VDF.Core.Utils.QualityRanker.Criterion<DuplicateItem>[] WebCriteria = {

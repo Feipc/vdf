@@ -60,4 +60,41 @@ public class CompareCommandOptionsTests {
 
 		Assert.Equal(-1, settings.MaxDegreeOfParallelism);
 	}
+
+	[Fact]
+	public void Compare_PartialVisualParallelism_IsApplied() {
+		var cmd = CompareCommand.Build();
+		var parse = cmd.Parse(new[] {
+			"--partial-clip-visual-parallelism", "8",
+			"--native-ffmpeg",
+			"--partial-clip-visual-threshold", "0.9",
+		});
+
+		var settings = new Settings();
+		SharedOptions.ApplyToSettings(settings, parse);
+
+		Assert.Equal(8, settings.PartialClipVisualMaxDegreeOfParallelism);
+		Assert.True(settings.UseNativeFfmpegBinding);
+		Assert.Equal(0.9, settings.PartialClipVisualThreshold);
+	}
+
+	[Theory]
+	[InlineData("fast", PartialClipSearchMode.FastBalanced)]
+	[InlineData("exact", PartialClipSearchMode.Exact)]
+	public void Compare_PartialClipSearchMode_IsApplied(
+		string value,
+		PartialClipSearchMode expected) {
+		var cmd = CompareCommand.Build();
+		var parse = cmd.Parse(new[] {
+			"--partial-clip-detection",
+			"--partial-clip-search-mode",
+			value,
+		});
+
+		var settings = new Settings();
+		SharedOptions.ApplyToSettings(settings, parse);
+
+		Assert.True(settings.EnablePartialClipDetection);
+		Assert.Equal(expected, settings.PartialClipSearchMode);
+	}
 }

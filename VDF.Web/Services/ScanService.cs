@@ -40,6 +40,17 @@ namespace VDF.Web.Services {
 		public int StageMax { get; init; }
 	}
 
+	public sealed class ComparisonProgressArgs {
+		public ComparisonStage Stage { get; init; }
+		public long Current { get; init; }
+		public long Total { get; init; }
+		public double ItemsPerSecond { get; init; }
+		public TimeSpan Elapsed { get; init; }
+		public TimeSpan Remaining { get; init; }
+		public int ActiveWorkers { get; init; }
+		public int EffectiveParallelism { get; init; }
+	}
+
 	/// <summary>
 	/// Singleton service that owns the ScanEngine instance and exposes
 	/// scan lifecycle operations to Blazor components via events and state.
@@ -47,29 +58,101 @@ namespace VDF.Web.Services {
 	public sealed class ScanService : IDisposable {
 		readonly ScanEngine _engine = new();
 		readonly WebSettingsService _settingsService;
+		readonly ResultThumbnailService _resultThumbnailService;
+		readonly ResultSnapshotStore _resultSnapshotStore;
+		readonly SemaphoreSlim _databaseInitializationGate = new(1, 1);
+		readonly object _snapshotLock = new();
+		readonly object _reviewStateLock = new();
+		readonly HashSet<string> _selectedResultPaths =
+			new(PathComparer.ForCurrentPlatform);
+		readonly HashSet<string> _excludedResultDirectories =
+			new(PathComparer.ForCurrentPlatform);
+		readonly HashSet<string> _protectedResultDirectories =
+			new(PathComparer.ForCurrentPlatform);
 		CancellationTokenSource _cts = new();
+		CancellationTokenSource? _snapshotSaveCts;
+		Task _pendingSnapshotSave = Task.CompletedTask;
+		List<DuplicateItem>? _preScanResults;
+		List<string>? _preScanSelectedPaths;
+		bool _resultsArePersistable;
+		bool _databaseLoadedSuccessfully;
+		bool _savedResultsRestored;
+		string? _loadedDatabaseFolder;
+		int _scanStartPending;
+		long _resultsRevision;
 
 		public ScanState State { get; private set; } = ScanState.Idle;
 		public string? ErrorMessage { get; private set; }
 		public ScanProgressArgs? LastProgress { get; private set; }
+		public ComparisonProgressArgs? LastComparisonProgress { get; private set; }
 		/// <summary>Total files hashed (captured when BuildingHashesDone fires).</summary>
 		public int FilesHashed { get; private set; }
 		public IReadOnlyCollection<DuplicateItem> Duplicates => _engine.Duplicates;
 		public Settings Settings => _engine.Settings;
+		public bool DatabaseLoadedSuccessfully => _databaseLoadedSuccessfully;
+		public long ResultsRevision => Volatile.Read(ref _resultsRevision);
+		public IReadOnlyCollection<string> SelectedResultPaths {
+			get {
+				lock (_reviewStateLock)
+					return _selectedResultPaths.ToArray();
+			}
+		}
+		public IReadOnlyCollection<string> ExcludedResultDirectories {
+			get {
+				lock (_reviewStateLock)
+					return _excludedResultDirectories.ToArray();
+			}
+		}
+
+		public IReadOnlyCollection<string> ProtectedResultDirectories {
+			get {
+				lock (_reviewStateLock)
+					return _protectedResultDirectories.ToArray();
+			}
+		}
+
+		public bool IsResultProtected(string path) {
+			lock (_reviewStateLock)
+				return ResultSelectionRules.IsProtected(path, _protectedResultDirectories);
+		}
+
+		public void UpdateProtectedResultDirectories(IEnumerable<string> directories) {
+			var normalized = directories.Select(ResultSelectionRules.NormalizeDirectory).ToArray();
+			lock (_reviewStateLock) {
+				if (FileOpRunning)
+					throw new InvalidOperationException("Wait for the current file operation to finish.");
+				_protectedResultDirectories.Clear();
+				_protectedResultDirectories.UnionWith(normalized);
+				PruneSelectedResultPathsLocked();
+			}
+			MarkResultsChanged();
+			ScheduleResultsSnapshotSave();
+			Notify();
+		}
 
 		/// <summary>Caches for the thumbnail endpoints — cleared whenever the results change wholesale.</summary>
-		public System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> HqThumbCache { get; } = new();
 		public System.Collections.Concurrent.ConcurrentDictionary<string, byte[]> FullThumbCache { get; } = new();
 
 		void ClearThumbnailCaches() {
-			HqThumbCache.Clear();
+			_resultThumbnailService.Clear();
 			FullThumbCache.Clear();
+		}
+
+		void MarkResultsChanged(bool clearThumbnailCaches = false) {
+			Interlocked.Increment(ref _resultsRevision);
+			if (clearThumbnailCaches)
+				ClearThumbnailCaches();
 		}
 
 		public event Action? StateChanged;
 
-		public ScanService(WebSettingsService settingsService) {
+		public ScanService(
+			WebSettingsService settingsService,
+			ResultThumbnailService resultThumbnailService,
+			ResultSnapshotStore resultSnapshotStore) {
 			_settingsService = settingsService;
+			_resultThumbnailService = resultThumbnailService;
+			_resultSnapshotStore = resultSnapshotStore;
 			settingsService.Load(_engine.Settings);
 
 			_engine.FilesEnumerated += (_, _) => Notify();
@@ -92,44 +175,258 @@ namespace VDF.Web.Services {
 				};
 				Notify();
 			};
+			_engine.ComparisonProgress += (_, e) => {
+				LastComparisonProgress = new ComparisonProgressArgs {
+					Stage = e.Stage,
+					Current = e.Current,
+					Total = e.Total,
+					ItemsPerSecond = e.ItemsPerSecond,
+					Elapsed = e.Elapsed,
+					Remaining = e.Remaining,
+					ActiveWorkers = e.ActiveWorkers,
+					EffectiveParallelism = e.EffectiveParallelism,
+				};
+				Notify();
+			};
 			_engine.ScanDone += (_, _) => {
 				// Skip low-res thumbnail retrieval — WebUI loads HQ thumbnails on demand
 				// via the /thumbnail/hq endpoint. This makes results available immediately.
 				State = ScanState.Done;
 				LastProgress = null;
+				LastComparisonProgress = null;
+				_preScanResults = null;
+				_preScanSelectedPaths = null;
+				lock (_reviewStateLock)
+					_selectedResultPaths.Clear();
+				_resultsArePersistable = true;
+				MarkResultsChanged();
+				ScheduleResultsSnapshotSave(immediate: true);
 				Notify();
 			};
 			_engine.ScanAborted += (_, _) => {
 				State = ScanState.Aborted;
 				LastProgress = null;
+				LastComparisonProgress = null;
+				RestorePreScanResults();
+				MarkResultsChanged();
 				Notify();
 			};
 		}
 
-		public void StartScanAndCompare() {
-			if (State == ScanState.Scanning || State == ScanState.Comparing) return;
-			_cts = new CancellationTokenSource();
-			State = ScanState.Scanning;
-			ErrorMessage = null;
-			LastProgress = null;
-			FilesHashed = 0;
-			_engine.Duplicates.Clear();
-			ClearThumbnailCaches();
+		public async Task<bool> InitializeAsync(
+			CancellationToken cancellationToken = default) {
+			await _databaseInitializationGate.WaitAsync(cancellationToken)
+				.ConfigureAwait(false);
 			try {
-				_engine.StartSearch();
+				if (!await EnsureDatabaseLoadedLockedAsync(cancellationToken)
+					.ConfigureAwait(false))
+					return false;
+
+				if (!_savedResultsRestored) {
+					await RestoreSavedResultsAsync(cancellationToken)
+						.ConfigureAwait(false);
+					_savedResultsRestored = true;
+				}
+				return true;
+			}
+			finally {
+				_databaseInitializationGate.Release();
+			}
+		}
+
+		async Task<bool> EnsureDatabaseLoadedAsync(
+			CancellationToken cancellationToken = default) {
+			await _databaseInitializationGate.WaitAsync(cancellationToken)
+				.ConfigureAwait(false);
+			try {
+				return await EnsureDatabaseLoadedLockedAsync(cancellationToken)
+					.ConfigureAwait(false);
+			}
+			finally {
+				_databaseInitializationGate.Release();
+			}
+		}
+
+		async Task<bool> EnsureDatabaseLoadedLockedAsync(
+			CancellationToken cancellationToken) {
+			cancellationToken.ThrowIfCancellationRequested();
+			string configuredFolder;
+			try {
+				if (!string.IsNullOrWhiteSpace(Settings.CustomDatabaseFolder)) {
+					configuredFolder = Path.GetFullPath(Settings.CustomDatabaseFolder);
+					if (!Directory.Exists(configuredFolder)) {
+						_databaseLoadedSuccessfully = false;
+						_loadedDatabaseFolder = configuredFolder;
+						Logger.Instance.Info(
+							$"Configured scan database folder '{configuredFolder}' " +
+							"does not exist or is not mounted.");
+						return false;
+					}
+				}
+				else {
+					configuredFolder = Path.GetFullPath(
+						CoreUtils.ResolveDatabaseFolder(null));
+				}
 			}
 			catch (Exception ex) {
-				SetError(ex);
-				return;
+				_databaseLoadedSuccessfully = false;
+				_loadedDatabaseFolder = Settings.CustomDatabaseFolder;
+				Logger.Instance.Info(
+					$"Configured scan database folder is invalid: {ex.Message}");
+				return false;
 			}
+			if (_databaseLoadedSuccessfully &&
+				PathComparer.ForCurrentPlatform.Equals(
+					_loadedDatabaseFolder,
+					configuredFolder))
+				return true;
+
+			ScanEngine.ConfigureDatabaseFolder(Settings.CustomDatabaseFolder);
+			bool loaded;
+			try {
+				loaded = await ScanEngine.LoadDatabase().ConfigureAwait(false);
+			}
+			catch (Exception ex) {
+				_databaseLoadedSuccessfully = false;
+				_loadedDatabaseFolder = configuredFolder;
+				Logger.Instance.Info(
+					$"Loading scan database from '{configuredFolder}' failed: {ex.Message}");
+				return false;
+			}
+
+			_databaseLoadedSuccessfully = loaded;
+			_loadedDatabaseFolder = configuredFolder;
+			if (!loaded) {
+				Logger.Instance.Info(
+					$"Refusing database-dependent work because the scan database " +
+					$"in '{configuredFolder}' could not be loaded.");
+				return false;
+			}
+
+			Logger.Instance.Info(
+				$"Configured scan database folder '{ScanEngine.ConfiguredDatabaseFolder}'; " +
+				$"{DatabaseEntryCount:N0} entries loaded.");
+			return true;
+		}
+
+		async Task<string?> PrepareDatabaseMutationAsync(string operation) {
+			if (!await EnsureDatabaseLoadedAsync().ConfigureAwait(false)) {
+				string error =
+					$"Cannot {operation}: the scan database could not be loaded.";
+				Logger.Instance.Info($"Refusing to {operation}: scan database load failed.");
+				return error;
+			}
+			if (!await ScanEngine.CreateDatabaseBackup().ConfigureAwait(false)) {
+				string error =
+					$"Cannot {operation}: the required scan database backup failed.";
+				Logger.Instance.Info($"Refusing to {operation}: required database backup failed.");
+				return error;
+			}
+			return null;
+		}
+
+		async Task RestoreSavedResultsAsync(
+			CancellationToken cancellationToken = default) {
+			if (State == ScanState.Scanning || State == ScanState.Comparing ||
+				_engine.Duplicates.Count > 0)
+				return;
+
+			WebResultSnapshot? snapshot =
+				await _resultSnapshotStore.LoadAsync(cancellationToken);
+			if (snapshot == null)
+				return;
+
+			_engine.Duplicates.Clear();
+			foreach (DuplicateItem item in snapshot.Items)
+				_engine.Duplicates.Add(item);
+			DropSingletonGroups();
+			lock (_reviewStateLock) {
+				_protectedResultDirectories.Clear();
+				foreach (string directory in snapshot.ProtectedDirectories)
+					if (TryNormalizeDirectory(directory, out string normalizedProtected))
+						_protectedResultDirectories.Add(normalizedProtected);
+				_excludedResultDirectories.Clear();
+				foreach (string directory in snapshot.ExcludedDirectories)
+					if (TryNormalizeDirectory(directory, out string normalized))
+						_excludedResultDirectories.Add(normalized);
+				_selectedResultPaths.Clear();
+				foreach (string path in snapshot.SelectedPaths)
+					if (!IsPathExcludedLocked(path))
+						_selectedResultPaths.Add(path);
+				PruneSelectedResultPathsLocked();
+			}
+
+			_resultsArePersistable = true;
+			if (_engine.Duplicates.Count > 0)
+				State = ScanState.Done;
+			MarkResultsChanged(clearThumbnailCaches: true);
+			Logger.Instance.Info(
+				$"Restored {_engine.Duplicates.Count:N0} Web result item(s), " +
+				$"{_selectedResultPaths.Count:N0} selection(s), and " +
+				$"{_excludedResultDirectories.Count:N0} excluded directorie(s) from the saved snapshot.");
 			Notify();
+		}
+
+		public async Task StartScanAndCompare() {
+			if (Interlocked.Exchange(ref _scanStartPending, 1) != 0)
+				return;
+			try {
+				if (State == ScanState.Scanning || State == ScanState.Comparing)
+					return;
+				string? databaseError =
+					await PrepareDatabaseMutationAsync("start the full scan")
+						.ConfigureAwait(false);
+				if (databaseError != null) {
+					SetError(new InvalidOperationException(databaseError));
+					return;
+				}
+				if (_resultsArePersistable) {
+					await FlushResultsSnapshotAsync().ConfigureAwait(false);
+					_preScanResults = _engine.Duplicates.ToList();
+					lock (_reviewStateLock)
+						_preScanSelectedPaths = _selectedResultPaths.ToList();
+				}
+				else {
+					_preScanResults = null;
+					_preScanSelectedPaths = null;
+				}
+				lock (_reviewStateLock)
+					_selectedResultPaths.Clear();
+				_resultsArePersistable = false;
+				_cts = new CancellationTokenSource();
+				State = ScanState.Scanning;
+				ErrorMessage = null;
+				LastProgress = null;
+				LastComparisonProgress = null;
+				FilesHashed = 0;
+				_engine.Duplicates.Clear();
+				MarkResultsChanged(clearThumbnailCaches: true);
+				try {
+					_engine.StartSearch();
+				}
+				catch (Exception ex) {
+					SetError(ex);
+					return;
+				}
+				Notify();
+			}
+			finally {
+				Volatile.Write(ref _scanStartPending, 0);
+			}
 		}
 
 		/// <summary>Called from global exception handlers to surface post-await async void exceptions.</summary>
 		public void SetError(Exception ex) {
+			bool restorePreviousResults =
+				State == ScanState.Scanning || State == ScanState.Comparing;
 			State = ScanState.Error;
 			ErrorMessage = ex.Message;
 			LastProgress = null;
+			LastComparisonProgress = null;
+			if (restorePreviousResults) {
+				RestorePreScanResults();
+				MarkResultsChanged();
+			}
 			Notify();
 		}
 
@@ -141,16 +438,44 @@ namespace VDF.Web.Services {
 			_cts.Cancel();
 		}
 
+		public void DismissError() {
+			if (State != ScanState.Error)
+				return;
+			ErrorMessage = null;
+			State = _engine.Duplicates.Count > 0 ? ScanState.Done : ScanState.Idle;
+			Notify();
+		}
+
 		public bool SaveSettings() => _settingsService.Save(_engine.Settings);
+
+		void ClearSavedResults() {
+			CancelScheduledSnapshotSave();
+			if (ProtectedResultDirectories.Count == 0) {
+				_resultSnapshotStore.Delete();
+				return;
+			}
+			// Keep configured protection even when the user clears the result list.
+			_resultsArePersistable = true;
+			ScheduleResultsSnapshotSave(immediate: true);
+		}
 
 		public void Reset() {
 			if (State == ScanState.Scanning || State == ScanState.Comparing) return;
 			State = ScanState.Idle;
 			ErrorMessage = null;
 			LastProgress = null;
+			LastComparisonProgress = null;
 			FilesHashed = 0;
 			_engine.Duplicates.Clear();
-			ClearThumbnailCaches();
+			_resultsArePersistable = false;
+			_preScanResults = null;
+			_preScanSelectedPaths = null;
+			lock (_reviewStateLock) {
+				_selectedResultPaths.Clear();
+				_excludedResultDirectories.Clear();
+			}
+			ClearSavedResults();
+			MarkResultsChanged(clearThumbnailCaches: true);
 			// Keep IncludeList/BlackList — resetting scan results should not
 			// throw away the paths the user configured.
 			Notify();
@@ -161,6 +486,10 @@ namespace VDF.Web.Services {
 			foreach (var item in items.ToList())
 				_engine.Duplicates.Remove(item);
 			DropSingletonGroups();
+			lock (_reviewStateLock)
+				PruneSelectedResultPathsLocked();
+			MarkResultsChanged();
+			ScheduleResultsSnapshotSave();
 			Notify();
 		}
 
@@ -176,6 +505,192 @@ namespace VDF.Web.Services {
 					_engine.Duplicates.Remove(d);
 		}
 
+		void RestorePreScanResults() {
+			if (_preScanResults == null) {
+				_preScanSelectedPaths = null;
+				_resultsArePersistable = false;
+				return;
+			}
+
+			_engine.Duplicates.Clear();
+			foreach (DuplicateItem item in _preScanResults)
+				_engine.Duplicates.Add(item);
+			_preScanResults = null;
+			lock (_reviewStateLock) {
+				_selectedResultPaths.Clear();
+				if (_preScanSelectedPaths != null)
+					foreach (string path in _preScanSelectedPaths)
+						if (!IsPathExcludedLocked(path))
+							_selectedResultPaths.Add(path);
+				PruneSelectedResultPathsLocked();
+			}
+			_preScanSelectedPaths = null;
+			_resultsArePersistable = true;
+		}
+
+		public void UpdateResultReviewState(
+			IEnumerable<string> selectedPaths,
+			IEnumerable<string> excludedDirectories) {
+			ArgumentNullException.ThrowIfNull(selectedPaths);
+			ArgumentNullException.ThrowIfNull(excludedDirectories);
+			lock (_reviewStateLock) {
+				_excludedResultDirectories.Clear();
+				foreach (string directory in excludedDirectories)
+					if (TryNormalizeDirectory(directory, out string normalized))
+						_excludedResultDirectories.Add(normalized);
+
+				_selectedResultPaths.Clear();
+				foreach (string path in selectedPaths)
+					if (!string.IsNullOrWhiteSpace(path) &&
+						!IsPathExcludedLocked(path))
+						_selectedResultPaths.Add(path);
+				PruneSelectedResultPathsLocked();
+			}
+			ScheduleResultsSnapshotSave();
+		}
+
+		void PruneSelectedResultPaths() {
+			lock (_reviewStateLock)
+				PruneSelectedResultPathsLocked();
+		}
+
+		void PruneSelectedResultPathsLocked() {
+			var resultPaths = new HashSet<string>(
+				_engine.Duplicates.Select(item => item.Path),
+				PathComparer.ForCurrentPlatform);
+			_selectedResultPaths.RemoveWhere(path => !resultPaths.Contains(path) ||
+				ResultSelectionRules.IsProtected(path, _protectedResultDirectories));
+		}
+
+		bool IsPathExcludedLocked(string path) =>
+			_excludedResultDirectories.Any(directory =>
+				ResultPresentationUtils.IsInDirectory(path, directory));
+
+		static bool TryNormalizeDirectory(string directory, out string normalized) {
+			try {
+				normalized = Path.TrimEndingDirectorySeparator(
+					Path.GetFullPath(directory));
+				return !string.IsNullOrWhiteSpace(normalized);
+			}
+			catch {
+				normalized = string.Empty;
+				return false;
+			}
+		}
+
+		(string[] SelectedPaths, string[] ExcludedDirectories, string[] ProtectedDirectories)
+			GetReviewStateSnapshot() {
+			lock (_reviewStateLock)
+				return (
+					_selectedResultPaths.ToArray(),
+					_excludedResultDirectories.ToArray(),
+					_protectedResultDirectories.ToArray());
+		}
+
+		void ScheduleResultsSnapshotSave(bool immediate = false) {
+			if (!_resultsArePersistable)
+				return;
+
+			List<DuplicateItem> snapshot = _engine.Duplicates.ToList();
+			var reviewState = GetReviewStateSnapshot();
+			var next = new CancellationTokenSource();
+			CancellationTokenSource? previous;
+			lock (_snapshotLock) {
+				previous = _snapshotSaveCts;
+				_snapshotSaveCts = next;
+				_pendingSnapshotSave = SaveSnapshotAfterDelayAsync(
+					snapshot,
+					reviewState.SelectedPaths,
+					reviewState.ExcludedDirectories,
+					reviewState.ProtectedDirectories,
+					immediate ? TimeSpan.Zero : TimeSpan.FromSeconds(1),
+					next);
+			}
+			TryCancel(previous);
+		}
+
+		async Task SaveSnapshotAfterDelayAsync(
+			IReadOnlyCollection<DuplicateItem> snapshot,
+			IReadOnlyCollection<string> selectedPaths,
+			IReadOnlyCollection<string> excludedDirectories,
+			IReadOnlyCollection<string> protectedDirectories,
+			TimeSpan delay,
+			CancellationTokenSource owner) {
+			try {
+				if (delay > TimeSpan.Zero)
+					await Task.Delay(delay, owner.Token).ConfigureAwait(false);
+				await _resultSnapshotStore.SaveAsync(
+					snapshot,
+					selectedPaths,
+					excludedDirectories,
+					owner.Token,
+					protectedDirectories)
+					.ConfigureAwait(false);
+			}
+			catch (OperationCanceledException) when (owner.IsCancellationRequested) { }
+			catch (Exception ex) {
+				Logger.Instance.Info(
+					$"Could not save Web results snapshot: {ex.Message}");
+			}
+			finally {
+				lock (_snapshotLock) {
+					if (ReferenceEquals(_snapshotSaveCts, owner)) {
+						_snapshotSaveCts = null;
+						_pendingSnapshotSave = Task.CompletedTask;
+					}
+				}
+				owner.Dispose();
+			}
+		}
+
+		void CancelScheduledSnapshotSave() {
+			CancellationTokenSource? cancellation;
+			lock (_snapshotLock) {
+				cancellation = _snapshotSaveCts;
+				_snapshotSaveCts = null;
+				_pendingSnapshotSave = Task.CompletedTask;
+			}
+			TryCancel(cancellation);
+		}
+
+		public async Task FlushResultsSnapshotAsync() {
+			if (!_resultsArePersistable) {
+				CancelScheduledSnapshotSave();
+				return;
+			}
+
+			List<DuplicateItem> snapshot = _engine.Duplicates.ToList();
+			var reviewState = GetReviewStateSnapshot();
+			Task pending;
+			CancellationTokenSource? cancellation;
+			lock (_snapshotLock) {
+				pending = _pendingSnapshotSave;
+				cancellation = _snapshotSaveCts;
+				_snapshotSaveCts = null;
+				_pendingSnapshotSave = Task.CompletedTask;
+			}
+			TryCancel(cancellation);
+			try { await pending.ConfigureAwait(false); }
+			catch { /* scheduled saves log their own errors */ }
+
+			try {
+				await _resultSnapshotStore.SaveAsync(
+					snapshot,
+					reviewState.SelectedPaths,
+					reviewState.ExcludedDirectories,
+					protectedDirectories: reviewState.ProtectedDirectories).ConfigureAwait(false);
+			}
+			catch (Exception ex) {
+				Logger.Instance.Info(
+					$"Could not flush Web results snapshot: {ex.Message}");
+			}
+		}
+
+		static void TryCancel(CancellationTokenSource? source) {
+			try { source?.Cancel(); }
+			catch (ObjectDisposedException) { }
+		}
+
 		// === Batch file operations (delete / move / link) ===
 
 		/// <summary>True while a delete/move/link batch is running.</summary>
@@ -185,28 +700,57 @@ namespace VDF.Web.Services {
 		public int FileOpMax { get; private set; }
 
 		bool TryBeginFileOp(string verb, int max) {
-			if (FileOpRunning || max == 0) return false;
-			FileOpRunning = true;
-			FileOpVerb = verb;
-			FileOpCurrent = 0;
-			FileOpMax = max;
+			lock (_reviewStateLock) {
+				if (FileOpRunning || max == 0) return false;
+				FileOpRunning = true;
+				FileOpVerb = verb;
+				FileOpCurrent = 0;
+				FileOpMax = max;
+			}
 			Notify();
 			return true;
 		}
 
 		void EndFileOp() {
-			FileOpRunning = false;
-			FileOpVerb = string.Empty;
+			lock (_reviewStateLock) {
+				FileOpRunning = false;
+				FileOpVerb = string.Empty;
+			}
 			Notify();
+		}
+
+		List<DuplicateItem> RejectProtectedItems(IEnumerable<DuplicateItem> items, FileOpResult result) {
+			var allowed = new List<DuplicateItem>();
+			foreach (var item in items) {
+				if (IsResultProtected(item.Path)) {
+					result.Failed++;
+					result.Errors.Add($"Protected file was skipped: {item.Path}");
+				}
+				else allowed.Add(item);
+			}
+			return allowed;
 		}
 
 		/// <summary>Deletes files from disk and removes them from results and the scan database.</summary>
 		public async Task<FileOpResult> DeleteItemsAsync(IEnumerable<DuplicateItem> items, bool permanent) {
-			var list = items.ToList();
 			var result = new FileOpResult();
+			var list = RejectProtectedItems(items, result);
+			if (list.Count == 0 || FileOpRunning)
+				return result;
+			string? databaseError = await PrepareDatabaseMutationAsync(
+				permanent ? "delete files permanently" : "move files to trash")
+				.ConfigureAwait(false);
+			if (databaseError != null) {
+				result.Errors.Add(databaseError);
+				result.Failed += list.Count;
+				return result;
+			}
 			if (!TryBeginFileOp(permanent ? "Deleting" : "Moving to trash", list.Count))
 				return result;
 			try {
+				// Protection may have changed while database initialization was awaited.
+				list = RejectProtectedItems(list, result);
+				FileOpMax = list.Count;
 				await Task.Run(() => {
 					// Windows: recycle the whole batch in one shell call — one
 					// SHFileOperation per file pays the full shell round-trip each time.
@@ -271,16 +815,32 @@ namespace VDF.Web.Services {
 					if (result.Done > 0)
 						ScanEngine.SaveDatabase();
 					DropSingletonGroups();
+					if (result.Done > 0)
+						MarkResultsChanged();
 				});
 			}
 			finally { EndFileOp(); }
+			if (result.Done > 0) {
+				PruneSelectedResultPaths();
+				ScheduleResultsSnapshotSave();
+			}
 			return result;
 		}
 
 		/// <summary>Moves files to a destination folder and updates the scan database paths.</summary>
 		public async Task<FileOpResult> MoveItemsAsync(IEnumerable<DuplicateItem> items, string destinationFolder) {
-			var list = items.ToList();
 			var result = new FileOpResult();
+			var list = RejectProtectedItems(items, result);
+			if (list.Count == 0 || FileOpRunning)
+				return result;
+			string? databaseError =
+				await PrepareDatabaseMutationAsync("move files")
+					.ConfigureAwait(false);
+			if (databaseError != null) {
+				result.Errors.Add(databaseError);
+				result.Failed += list.Count;
+				return result;
+			}
 			try { Directory.CreateDirectory(destinationFolder); }
 			catch (Exception ex) {
 				result.Errors.Add($"Cannot create destination folder: {ex.Message}");
@@ -289,6 +849,8 @@ namespace VDF.Web.Services {
 			if (!TryBeginFileOp("Moving", list.Count))
 				return result;
 			try {
+				list = RejectProtectedItems(list, result);
+				FileOpMax = list.Count;
 				await Task.Run(() => {
 					var sw = System.Diagnostics.Stopwatch.StartNew();
 					foreach (var item in list) {
@@ -318,9 +880,15 @@ namespace VDF.Web.Services {
 					if (result.Done > 0)
 						ScanEngine.SaveDatabase();
 					DropSingletonGroups();
+					if (result.Done > 0)
+						MarkResultsChanged();
 				});
 			}
 			finally { EndFileOp(); }
+			if (result.Done > 0) {
+				PruneSelectedResultPaths();
+				ScheduleResultsSnapshotSave();
+			}
 			return result;
 		}
 
@@ -329,11 +897,23 @@ namespace VDF.Web.Services {
 		/// group (the highest-similarity unselected member that still exists on disk).
 		/// </summary>
 		public async Task<FileOpResult> CreateLinksAsync(IEnumerable<DuplicateItem> items, bool hardLinks) {
-			var list = items.ToList();
 			var result = new FileOpResult();
+			var list = RejectProtectedItems(items, result);
+			if (list.Count == 0 || FileOpRunning)
+				return result;
+			string? databaseError = await PrepareDatabaseMutationAsync(
+				hardLinks ? "replace files with hardlinks" : "replace files with symlinks")
+				.ConfigureAwait(false);
+			if (databaseError != null) {
+				result.Errors.Add(databaseError);
+				result.Failed += list.Count;
+				return result;
+			}
 			if (!TryBeginFileOp(hardLinks ? "Creating hardlinks" : "Creating symlinks", list.Count))
 				return result;
 			try {
+				list = RejectProtectedItems(list, result);
+				FileOpMax = list.Count;
 				await Task.Run(() => {
 					var selected = list.ToHashSet();
 					var keeperByGroup = _engine.Duplicates
@@ -376,15 +956,23 @@ namespace VDF.Web.Services {
 					if (result.Done > 0)
 						ScanEngine.SaveDatabase();
 					DropSingletonGroups();
+					if (result.Done > 0)
+						MarkResultsChanged();
 				});
 			}
 			finally { EndFileOp(); }
+			if (result.Done > 0) {
+				PruneSelectedResultPaths();
+				ScheduleResultsSnapshotSave();
+			}
 			return result;
 		}
 
 		/// <summary>Removes database entries for files that no longer exist or have errors.</summary>
 		public async Task<int> CleanDatabaseAsync() {
-			await ScanEngine.LoadDatabase();
+			if (!await EnsureDatabaseLoadedAsync().ConfigureAwait(false))
+				throw new InvalidOperationException(
+					"Cannot clean the scan database because it could not be loaded.");
 			int before = DatabaseEntryCount;
 			await Task.Run(() => _engine.CleanupDatabase());
 			return before - DatabaseEntryCount;
@@ -392,9 +980,20 @@ namespace VDF.Web.Services {
 
 		/// <summary>Wipes all entries from the scan database.</summary>
 		public async Task ClearDatabaseAsync() {
-			await ScanEngine.LoadDatabase();
+			if (!await EnsureDatabaseLoadedAsync().ConfigureAwait(false))
+				throw new InvalidOperationException(
+					"Cannot clear the scan database because it could not be loaded.");
 			ScanEngine.ClearDatabase();
 			_engine.Duplicates.Clear();
+			_resultsArePersistable = false;
+			_preScanResults = null;
+			_preScanSelectedPaths = null;
+			lock (_reviewStateLock) {
+				_selectedResultPaths.Clear();
+				_excludedResultDirectories.Clear();
+			}
+			ClearSavedResults();
+			MarkResultsChanged(clearThumbnailCaches: true);
 			Notify();
 		}
 
@@ -413,6 +1012,10 @@ namespace VDF.Web.Services {
 
 		void Notify() => StateChanged?.Invoke();
 
-		public void Dispose() => _cts.Dispose();
+		public void Dispose() {
+			CancelScheduledSnapshotSave();
+			_cts.Dispose();
+			_databaseInitializationGate.Dispose();
+		}
 	}
 }

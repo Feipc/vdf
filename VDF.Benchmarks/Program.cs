@@ -29,6 +29,18 @@ internal static class Program {
 		if (args.Length > 0 && args[0] == "--probe-compare")
 			return ComparePhaseProbe.Run(args);
 
+		if (args.Length > 0 && args[0] == "--probe-partial-compare")
+			return PartialComparePhaseProbe.Run(args);
+
+		if (args.Length > 0 && args[0] == "--probe-partial-visual")
+			return PartialVisualVerificationProbe.Run(args);
+
+		if (args.Length > 0 && args[0] == "--probe-stage-autotune")
+			return StageWorkerAutotuneProbe.Run(args);
+
+		if (args.Length > 0 && args[0] == "--probe-results")
+			return ResultsProjectionProbe.Run(args);
+
 		// BenchmarkSwitcher routes CLI args (--filter, --list, --job, --exporters …)
 		// to BDN. With no args, prints the menu of available benchmarks.
 		BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args);

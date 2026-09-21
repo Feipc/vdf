@@ -87,7 +87,12 @@ public class FftServiceTests {
 			}
 		}
 
-		Assert.Equal(targetBin, maxBin);
+		// A real-valued cosine has conjugate-symmetric, equal-magnitude peaks at
+		// k and N-k. Tiny platform-specific floating-point differences can make
+		// either side compare as the maximum.
+		Assert.True(
+			maxBin == targetBin || maxBin == n - targetBin,
+			$"Expected peak at bin {targetBin} or {n - targetBin}, got {maxBin}");
 	}
 
 	[Fact]

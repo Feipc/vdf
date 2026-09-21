@@ -48,6 +48,15 @@ public static class ComparePhaseProbe {
 		RunCompareScenario("videos-3000-linear-gray", count: 3000, usePHashing: false, durationMin: 30, durationSpread: 3570);
 		RunCompareScenario("videos-8000-bucketed-gray", count: 8000, usePHashing: false, durationMin: 30, durationSpread: 3570);
 		RunCompareScenario("videos-8000-bucketed-phash", count: 8000, usePHashing: true, durationMin: 30, durationSpread: 3570);
+		// Every entry lands in the same whole-second duration bucket. This reproduces
+		// the old tail where one worker owned thousands of serial comparisons.
+		RunCompareScenario(
+			"videos-8000-one-bucket-phash",
+			count: 8000,
+			usePHashing: true,
+			durationMin: 1200,
+			durationSpread: 0.2,
+			memberDurationJitter: 0);
 		// Dense duration cluster (e.g. a TV-series library, 20±2 min): nearly every
 		// pair passes the duration filter, so CheckIfDuplicate dominates.
 		RunCompareScenario("videos-6000-dense-gray", count: 6000, usePHashing: false, durationMin: 1200, durationSpread: 240);
@@ -64,7 +73,12 @@ public static class ComparePhaseProbe {
 	/// independent random patterns, which sit at ~33% difference — guaranteed
 	/// non-duplicates that still exercise the full comparison cost.
 	/// </summary>
-	static List<FileEntry> BuildCorpus(int count, Random rng, double durationMin = 30, double durationSpread = 3570) {
+	internal static List<FileEntry> BuildCorpus(
+		int count,
+		Random rng,
+		double durationMin = 30,
+		double durationSpread = 3570,
+		double memberDurationJitter = 0.01) {
 		var positions = new List<float>();
 		float positionCounter = 0f;
 		for (int i = 0; i < ThumbnailCount; i++) {
@@ -91,7 +105,10 @@ public static class ComparePhaseProbe {
 					Folder = $@"C:\bench\folder{fileIndex % 100}",
 					FileSize = 1_000_000 + rng.Next(1_000_000),
 					mediaInfo = new MediaInfo {
-						Duration = TimeSpan.FromSeconds(m == 0 ? duration : duration * (1.0 + (rng.NextDouble() - 0.5) * 0.01)),
+						Duration = TimeSpan.FromSeconds(
+							m == 0
+								? duration
+								: duration * (1.0 + (rng.NextDouble() - 0.5) * memberDurationJitter)),
 						Streams = new[] {
 							new MediaInfo.StreamInfo {
 								CodecType = "video", CodecName = "h264",
@@ -135,8 +152,19 @@ public static class ComparePhaseProbe {
 		return engine;
 	}
 
-	static void RunCompareScenario(string name, int count, bool usePHashing, double durationMin, double durationSpread) {
-		var entries = BuildCorpus(count, new Random(12345), durationMin, durationSpread);
+	static void RunCompareScenario(
+		string name,
+		int count,
+		bool usePHashing,
+		double durationMin,
+		double durationSpread,
+		double memberDurationJitter = 0.01) {
+		var entries = BuildCorpus(
+			count,
+			new Random(12345),
+			durationMin,
+			durationSpread,
+			memberDurationJitter);
 		DatabaseUtils.Database.Clear();
 		foreach (var entry in entries)
 			DatabaseUtils.Database.Add(entry);
@@ -145,6 +173,20 @@ public static class ComparePhaseProbe {
 
 		var times = new List<double>();
 		int duplicateCount = 0, groupCount = 0;
+		int peakActiveWorkers = 0;
+		engine.ComparisonProgress += (_, progress) => {
+			int active = progress.ActiveWorkers;
+			int current;
+			do {
+				current = Volatile.Read(ref peakActiveWorkers);
+				if (current >= active)
+					break;
+			}
+			while (Interlocked.CompareExchange(
+				ref peakActiveWorkers,
+				active,
+				current) != current);
+		};
 		for (int it = 0; it < WarmupIterations + Iterations; it++) {
 			var sw = Stopwatch.StartNew();
 			engine.ScanForDuplicates();
@@ -155,7 +197,10 @@ public static class ComparePhaseProbe {
 			groupCount = engine.Duplicates.Select(d => d.GroupId).Distinct().Count();
 		}
 
-		Report(name, times, $"duplicates={duplicateCount} groups={groupCount}");
+		Report(
+			name,
+			times,
+			$"duplicates={duplicateCount} groups={groupCount} peakWorkers={peakActiveWorkers}");
 		DatabaseUtils.Database.Clear();
 	}
 

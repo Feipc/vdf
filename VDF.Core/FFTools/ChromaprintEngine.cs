@@ -29,6 +29,7 @@ namespace VDF.Core.FFTools {
 	/// </summary>
 	internal static class ChromaprintEngine {
 		private const int TimeoutMs = 30_000; // 30 seconds max for process exit after stream ends
+		private const int ReadInactivityTimeoutMs = 30_000;
 		private const int TargetSampleRate = 11025;
 		private const int TargetChannels = 1;
 		// Read PCM in 32 KB chunks — keeps memory low while giving ChromaContext
@@ -154,7 +155,24 @@ namespace VDF.Core.FFTools {
 						return null;
 					}
 
-					int bytesRead = stream.Read(buf, 0, buf.Length);
+					int bytesRead;
+					using (var readCancellation =
+						CancellationTokenSource.CreateLinkedTokenSource(ct)) {
+						readCancellation.CancelAfter(ReadInactivityTimeoutMs);
+						using CancellationTokenRegistration registration =
+							readCancellation.Token.Register(() => KillProcess(process));
+						try {
+							bytesRead = stream.ReadAsync(
+								buf.AsMemory(0, buf.Length),
+								readCancellation.Token).AsTask().GetAwaiter().GetResult();
+						}
+						catch (OperationCanceledException) when (!ct.IsCancellationRequested) {
+							Logger.Instance.Info(
+								$"[ChromaprintEngine] No PCM output for " +
+								$"{ReadInactivityTimeoutMs / 1000}s on '{filePath}'; FFmpeg was terminated.");
+							return null;
+						}
+					}
 					if (bytesRead <= 0) break;
 
 					totalBytes += bytesRead;
@@ -189,7 +207,13 @@ namespace VDF.Core.FFTools {
 					return null;
 				}
 
-				process.WaitForExit(TimeoutMs);
+				if (!process.WaitForExit(TimeoutMs)) {
+					Logger.Instance.Info(
+						$"[ChromaprintEngine] FFmpeg did not exit within {TimeoutMs / 1000}s " +
+						$"after PCM ended for '{filePath}'; process was terminated.");
+					KillProcess(process);
+					return null;
+				}
 
 				if (extendedLogging && errOutput.Length > 0)
 					Logger.Instance.Info($"[ChromaprintEngine] {Path.GetFileName(filePath)}: {errOutput}");
@@ -221,7 +245,7 @@ namespace VDF.Core.FFTools {
 		private static void KillProcess(Process process) {
 			try {
 				if (!process.HasExited)
-					process.Kill();
+					process.Kill(entireProcessTree: true);
 			}
 			catch { }
 		}
