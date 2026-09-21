@@ -239,7 +239,7 @@ else {
         float groupSimilarity = group.MinimumSimilarity;
         string groupSimilarityText = ResultPresentationUtils.FormatGroupSimilarity(sortedItems);
         int thumbnailCount = ThumbnailPositionResolver.GetFrameCount(sortedItems[0], Scan.Settings);
-        int thumbnailIndex = Math.Clamp(_groupThumbnailIndices.GetValueOrDefault(groupId), 0, thumbnailCount - 1);
+        int thumbnailIndex = GroupThumbnailIndex(groupId, thumbnailCount);
         long groupSize = group.TotalSize;
         int groupIndex = renderIndex++;
         int hiddenCount = sortedItems.Count(i => _hiddenItems.Contains(i.Path));
@@ -996,9 +996,14 @@ else {
 
     void ChangeGroupThumbnail(Guid groupId, int count, int delta) {
         if (count <= 1) return;
-        int current = Math.Clamp(_groupThumbnailIndices.GetValueOrDefault(groupId), 0, count - 1);
+        int current = GroupThumbnailIndex(groupId, count);
         _groupThumbnailIndices[groupId] = (current + delta + count) % count;
     }
+
+    int GroupThumbnailIndex(Guid groupId, int count) =>
+        _groupThumbnailIndices.TryGetValue(groupId, out int index)
+            ? Math.Clamp(index, 0, count - 1)
+            : FramePositions.MiddleFrame(count);
 
     static string SimilarityTitle(DuplicateItem item, bool isReference) {
         if (isReference)

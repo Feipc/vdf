@@ -121,6 +121,13 @@ public sealed class ResultsPageTests : BunitContext {
 			// the server saw parameters named "amp;w" and "amp;q" and ignored them.
 			Assert.DoesNotContain("amp;", url);
 		});
+		Assert.Equal("2/3", page.Find(".thumbnail-counter").TextContent);
+
+		page.Find("[title='Previous synchronized thumbnail']").Click();
+
+		Assert.Equal("1/3", page.Find(".thumbnail-counter").TextContent);
+		Assert.All(page.FindAll(".card-thumb img"), img =>
+			Assert.EndsWith("&w=480&q=85&t=15.00", img.GetAttribute("data-src")));
 	}
 
 	[Fact]
