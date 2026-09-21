@@ -205,7 +205,13 @@ namespace VDF.Core.FFTools {
 					return null;
 				}
 
-				process.WaitForExit(TimeoutMs);
+				if (!process.WaitForExit(TimeoutMs)) {
+					Logger.Instance.Info(
+						$"[ChromaprintEngine] FFmpeg did not exit within {TimeoutMs / 1000}s " +
+						$"after PCM ended for '{filePath}'; process was terminated.");
+					KillProcess(process);
+					return null;
+				}
 
 				if (extendedLogging && errOutput.Length > 0)
 					Logger.Instance.Info($"[ChromaprintEngine] {Path.GetFileName(filePath)}: {errOutput}");
@@ -243,7 +249,7 @@ namespace VDF.Core.FFTools {
 		static void KillProcess(Process process) {
 			try {
 				if (!process.HasExited)
-					process.Kill();
+					process.Kill(entireProcessTree: true);
 			}
 			catch { }
 		}

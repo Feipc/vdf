@@ -171,6 +171,15 @@ namespace VDF.CLI.Commands {
 			CustomParser = r => ParseInvariantFloat(r, 89f)
 		};
 
+		internal static readonly Option<int> PartialClipVisualParallelism = new("--partial-clip-visual-parallelism") {
+			Description = "Maximum decoder workers for partial-clip visual confirmation (1-16). Default: 6.",
+			DefaultValueFactory = _ => 6
+		};
+
+		internal static readonly Option<string?> PartialClipSearchMode = new("--partial-clip-search-mode") {
+			Description = "Partial-clip candidate search mode: fast (default) or exact."
+		};
+
 		internal static readonly Option<int> CheckpointInterval = new("--checkpoint-interval") {
 			Description = "Database checkpoint interval in minutes during scanning. 0 = disabled. Default: 5.",
 			DefaultValueFactory = _ => 5

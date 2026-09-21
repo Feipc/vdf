@@ -6,6 +6,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>VDF.Web</RootNamespace>
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
@@ -13,6 +15,10 @@
   </ItemGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="VDF.IntegrationTests" />
+    <InternalsVisibleTo Include="VDF.Web.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="VDF.Web.Tests" />
   </ItemGroup>
 

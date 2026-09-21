@@ -40,6 +40,7 @@ namespace VDF.Core {
 			add => progress.Progress += value;
 			remove => progress.Progress -= value;
 		}
+		public event EventHandler<ComparisonProgressChangedEventArgs>? ComparisonProgress;
 		public event EventHandler? BuildingHashesDone;
 		public event EventHandler? ScanDone;
 		public event EventHandler? ScanAborted;
@@ -326,6 +327,7 @@ namespace VDF.Core {
 		public static bool FFmpegExists => !string.IsNullOrEmpty(FfmpegEngine.FFmpegPath);
 		public static bool FFprobeExists => !string.IsNullOrEmpty(FFProbeEngine.FFprobePath);
 		public static bool NativeFFmpegExists => FFTools.FFmpegNative.FFmpegHelper.DoFFmpegLibraryFilesExist;
+		public static bool NativeFFmpegCanLoad => FFTools.FFmpegNative.FFmpegHelper.CanLoadNativeLibraries;
 
 		/// <param name="searchAndCompare">
 		/// When true (GUI/Web default) the search chains straight into <see cref="StartCompare"/>.
@@ -906,6 +908,10 @@ namespace VDF.Core {
 		bool InvalidEntryForDuplicateCheck(FileEntry entry) =>
 			entry.invalid || entry.mediaInfo == null || entry.Flags.Has(EntryFlags.ThumbnailError) || (!entry.IsImage && entry.grayBytes.Count < Settings.ThumbnailCount);
 
+		public static void ConfigureDatabaseFolder(string? folder) =>
+			DatabaseUtils.ConfigureDatabaseFolder(folder);
+		public static string ConfiguredDatabaseFolder =>
+			DatabaseUtils.ConfiguredDatabaseFolder;
 		public static Task<bool> LoadDatabase() => Task.Run(DatabaseUtils.LoadDatabase);
 		/// <summary>
 		/// Loads the database from a custom folder. Callers with a configured custom
@@ -915,10 +921,11 @@ namespace VDF.Core {
 		/// database viewer, entry counts) read the wrong database.
 		/// </summary>
 		public static Task<bool> LoadDatabase(string? customDatabaseFolder) => Task.Run(() => {
-			DatabaseUtils.CustomDatabaseFolder = string.IsNullOrEmpty(customDatabaseFolder) ? null : customDatabaseFolder;
-			DatabaseUtils.InvalidateDatabaseFolder();
+			DatabaseUtils.ConfigureDatabaseFolder(customDatabaseFolder);
 			return DatabaseUtils.LoadDatabase();
 		});
+		public static Task<bool> CreateDatabaseBackup() =>
+			Task.Run(DatabaseUtils.CreateBackup);
 		public static void SaveDatabase() => DatabaseUtils.SaveDatabase();
 		public static void RemoveFromDatabase(FileEntry dbEntry) => DatabaseUtils.Database.Remove(dbEntry);
 
@@ -2167,10 +2174,13 @@ namespace VDF.Core {
 					logMatch(source, clip, sim, offsetSec);
 
 				if (addedSources.Add(si))
-					Duplicates.Add(new DuplicateItem(source, 0f, groupId, DuplicateFlags.None));
+					Duplicates.Add(new DuplicateItem(source, 0f, groupId, DuplicateFlags.None) {
+						IsSimilarityReference = true,
+					});
 
 				Duplicates.Add(new DuplicateItem(clip, 1f - sim, groupId, clipFlags) {
-					PartialClipOffset = TimeSpan.FromSeconds(offsetSec)
+					PartialClipOffset = TimeSpan.FromSeconds(offsetSec),
+					SimilarityReferencePath = source.Path,
 				});
 			}
 		}

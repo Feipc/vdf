@@ -18,6 +18,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using VDF.Core;
 using VDF.Core.FFTools;
+using VDF.Core.Utils;
 
 namespace VDF.Web.Services {
 	public sealed class WebSettingsService {
@@ -107,6 +108,9 @@ namespace VDF.Web.Services {
 				return Path.Combine(folder, "web-settings.json");
 			}
 		}
+
+		public static string DefaultWorkerProfilePath =>
+			Path.Combine(Path.GetDirectoryName(SettingsPath)!, "worker-profile.json");
 
 		public bool Load(Settings s) {
 			if (!File.Exists(SettingsPath)) return false;
@@ -239,5 +243,76 @@ namespace VDF.Web.Services {
 			}
 			catch { return false; }
 		}
+
+		public static bool TryImportWorkerProfile(
+			Settings settings,
+			Stream json,
+			out WorkerProfile? profile,
+			out string? error) {
+			try {
+				profile = JsonSerializer.Deserialize(json, CoreJsonContext.Default.WorkerProfile);
+				if (profile == null) {
+					error = "The selected file does not contain a worker profile.";
+					return false;
+				}
+				if (!profile.TryValidate(out error))
+					return false;
+				profile.ApplyTo(settings);
+				return true;
+			}
+			catch (Exception exception) {
+				profile = null;
+				error = $"Could not import worker profile: {exception.Message}";
+				return false;
+			}
+		}
+
+		public static bool TryImportSavedWorkerProfile(
+			Settings settings,
+			out WorkerProfile? profile,
+			out string? error) {
+			if (!File.Exists(DefaultWorkerProfilePath)) {
+				profile = null;
+				error = $"No benchmark profile was found at {DefaultWorkerProfilePath}.";
+				return false;
+			}
+			using FileStream stream = File.OpenRead(DefaultWorkerProfilePath);
+			return TryImportWorkerProfile(settings, stream, out profile, out error);
+		}
+
+		public static WorkerProfile CreateWorkerProfile(Settings settings) =>
+			new() {
+				Completed = true,
+				VisibleCpuCount = Environment.ProcessorCount,
+				Preset = "manual",
+				MetadataWorkers = ResolveExportValue(
+					settings.MetadataMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				FrameHashWorkers = ResolveExportValue(
+					settings.FrameHashMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				AudioHashWorkers = ResolveExportValue(
+					settings.AudioHashMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				VisualCompareWorkers = ResolveExportValue(
+					settings.VisualCompareMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PHashCompareWorkers = ResolveExportValue(
+					settings.PHashCompareMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialIndexWorkers = ResolveExportValue(
+					settings.PartialIndexMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialExactWorkers = ResolveExportValue(
+					settings.PartialExactMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+				PartialVisualSourceWorkers = Math.Clamp(
+					settings.PartialClipVisualMaxDegreeOfParallelism, 1, 16),
+				PartialVisualClipWorkers = Math.Clamp(
+					settings.PartialClipVisualMaxDegreeOfParallelism, 1, 16),
+				ThumbnailWorkers = ResolveExportValue(
+					settings.ThumbnailMaxDegreeOfParallelism, settings.MaxDegreeOfParallelism),
+			};
+
+		static int ResolveExportValue(int stageValue, int globalValue) =>
+			WorkerParallelism.Resolve(stageValue, globalValue);
+
+		static int NormalizeStageWorkers(int value) =>
+			value == -1 || value is >= 0 and <= WorkerParallelism.MaximumConfiguredWorkers
+				? value
+				: 0;
 	}
 }

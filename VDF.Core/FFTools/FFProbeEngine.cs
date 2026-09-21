@@ -84,7 +84,7 @@ namespace VDF.Core.FFTools {
 				errOut += $"{Environment.NewLine}{e.Message}";
 				try {
 					if (process.HasExited == false)
-						process.Kill();
+						process.Kill(entireProcessTree: true);
 				}
 				catch { }
 				mediaInfo = null;
@@ -148,4 +148,3 @@ namespace VDF.Core.FFTools {
 		}
 	}
 }
-

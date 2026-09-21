@@ -13,10 +13,12 @@
 //     along with VideoDuplicateFinder.  If not, see <http://www.gnu.org/licenses/>.
 // */
 //
-
+using System.Text.Json.Serialization;
 
 namespace VDF.Core {
 	public enum FolderMatchMode { None, SameFolderOnly, DifferentFolderOnly }
+	[JsonConverter(typeof(JsonStringEnumConverter<PartialClipSearchMode>))]
+	public enum PartialClipSearchMode { FastBalanced, Exact }
 
 	public sealed class Settings {
 		// Settable so System.Text.Json can populate these from --settings JSON; without
@@ -87,6 +89,22 @@ namespace VDF.Core {
 		/// <summary>Maximum width in pixels for display thumbnails (0 = original resolution).</summary>
 		public int ThumbnailMaxWidth = 100;
 		public int MaxDegreeOfParallelism = 1;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int MetadataMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int FrameHashMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int AudioHashMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int VisualCompareMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int PHashCompareMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int PartialIndexMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int PartialExactMaxDegreeOfParallelism;
+		/// <summary>Stage worker override. 0 inherits <see cref="MaxDegreeOfParallelism"/>.</summary>
+		public int ThumbnailMaxDegreeOfParallelism;
 		/// <summary>
 		/// Per-drive concurrency cap for slow drives (spindle HDDs, network shares, drives that
 		/// cannot be classified). A single spinning disk seek-thrashes when many files are read
@@ -156,6 +174,18 @@ namespace VDF.Core {
 		/// 32×32 grayscale percentage difference.
 		/// </summary>
 		public double PartialClipVisualThreshold = 0.85;
+		/// <summary>
+		/// Maximum decoder workers used by partial-clip visual confirmation. This is
+		/// independently capped because spinning disks usually slow down under excessive
+		/// concurrent random seeks. Valid Web UI range is 1-16; default 6.
+		/// </summary>
+		public int PartialClipVisualMaxDegreeOfParallelism = 6;
+		/// <summary>Candidate search strategy. FastBalanced uses an approximate index followed by exact verification.</summary>
+		public PartialClipSearchMode PartialClipSearchMode = VDF.Core.PartialClipSearchMode.FastBalanced;
+		/// <summary>Maximum exact source candidates retained per indexed clip.</summary>
+		public int PartialClipMaxCandidates = 256;
+		/// <summary>Maximum transient fingerprint-index memory in MiB.</summary>
+		public int PartialClipIndexMemoryLimitMB = 8192;
 
 		// ── AI matching (neural embeddings) ─────────────────────────────────
 		/// <summary>

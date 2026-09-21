@@ -24,6 +24,8 @@ using MemoryPack;
 namespace VDF.Core.Utils {
 	static class DatabaseUtils {
 		static DatabaseUtils() => MemoryPackRegistration.Register();
+		const int BackupSlotCount = 5;
+		static readonly object DatabaseIoLock = new();
 
 		// Database on-disk formats, newest first:
 		//   "VDFDB002" – streaming MemoryPack: header ints followed by one
@@ -46,7 +48,10 @@ namespace VDF.Core.Utils {
 
 		static string ResolveDatabaseFolder() => CoreUtils.ResolveDatabaseFolder(CustomDatabaseFolder);
 
-		internal static void InvalidateDatabaseFolder() => _resolvedDatabaseFolder = null;
+		internal static void InvalidateDatabaseFolder() {
+			lock (DatabaseIoLock)
+				_resolvedDatabaseFolder = null;
+		}
 
 		static string DatabaseFolder => _resolvedDatabaseFolder ??= ResolveDatabaseFolder();
 
@@ -55,72 +60,192 @@ namespace VDF.Core.Utils {
 
 		static string CurrentDatabasePath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles.db");
 		static string TempDatabasePath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles_new.db");
+		static string BackupTempPath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles.backup-new.db");
+		static string RestoreTempPath => FileUtils.SafePathCombine(DatabaseFolder, "ScannedFiles.restore-new.db");
+		static string BackupPath(int slot) =>
+			FileUtils.SafePathCombine(DatabaseFolder, $"ScannedFiles.backup-{slot}.db");
+
+		internal static string ConfiguredDatabaseFolder {
+			get {
+				lock (DatabaseIoLock)
+					return DatabaseFolder;
+			}
+		}
+
+		internal static void ConfigureDatabaseFolder(string? folder) {
+			lock (DatabaseIoLock) {
+				CustomDatabaseFolder = folder;
+				_resolvedDatabaseFolder = null;
+			}
+		}
 
 		internal static bool LoadDatabase() {
-			FileInfo databaseFile = new(TempDatabasePath);
-			if (!databaseFile.Exists)
-				databaseFile = new(CurrentDatabasePath);
+			lock (DatabaseIoLock)
+				return LoadDatabaseLocked();
+		}
 
-			if (databaseFile.Exists && databaseFile.Length == 0) //invalid data
-			{
-				databaseFile.Delete();
-				MigrateImageHashesIfNeeded();
+		static bool LoadDatabaseLocked() {
+			var stopwatch = Stopwatch.StartNew();
+			bool candidateFound = false;
+			if (File.Exists(TempDatabasePath)) {
+				candidateFound = true;
+				if (TryReadDatabase(TempDatabasePath, out DatabaseWrapper? temporary, out Exception? error)) {
+					if (!PromoteTemporaryDatabase(out Exception? promoteError)) {
+						Logger.Instance.Error($"Promoting the recovered temporary scan database failed: {promoteError?.Message ?? "unknown error"}");
+						return false;
+					}
+					AcceptLoadedDatabase(temporary!, CurrentDatabasePath, stopwatch.Elapsed);
+					return true;
+				}
+				LogLoadFailure("temporary database", TempDatabasePath, error);
+				if (!DeleteInvalidTemporaryDatabase())
+					return false;
+			}
+			if (File.Exists(CurrentDatabasePath)) {
+				candidateFound = true;
+				if (TryReadDatabase(CurrentDatabasePath, out DatabaseWrapper? current, out Exception? error)) {
+					AcceptLoadedDatabase(current!, CurrentDatabasePath, stopwatch.Elapsed);
+					return true;
+				}
+				LogLoadFailure("main database", CurrentDatabasePath, error);
+				QuarantineDamagedMainDatabase();
+			}
+			for (int slot = 1; slot <= BackupSlotCount; slot++) {
+				string backupPath = BackupPath(slot);
+				if (!File.Exists(backupPath))
+					continue;
+				candidateFound = true;
+				if (!TryReadDatabase(backupPath, out DatabaseWrapper? backup, out Exception? error)) {
+					LogLoadFailure($"backup slot {slot}", backupPath, error);
+					continue;
+				}
+				if (!RestoreBackupToMain(backupPath, out Exception? restoreError)) {
+					Logger.Instance.Error($"Restoring scan database from backup slot {slot} failed: {restoreError?.Message ?? "unknown error"}");
+					return false;
+				}
+				AcceptLoadedDatabase(backup!, BackupPath(slot), stopwatch.Elapsed);
+				Logger.Instance.Info($"Automatically recovered scan database from backup slot {slot}.");
 				return true;
 			}
-			if (!databaseFile.Exists) {
+			if (!candidateFound) {
+				DbWrapper = new DatabaseWrapper();
 				MigrateImageHashesIfNeeded();
+				Logger.Instance.Info($"No scan database was found in '{DatabaseFolder}'; starting with an empty database.");
 				return true;
 			}
+			Logger.Instance.Error("Loading the scan database failed: no valid temporary, main, or backup database was available.");
+			return false;
+		}
 
-			Logger.Instance.Info("Found previously scanned files, importing...");
-			var st = Stopwatch.StartNew();
+		static bool TryReadDatabase(string path, out DatabaseWrapper? wrapper, out Exception? error) {
+			wrapper = null;
+			error = null;
 			try {
-				using var file = new FileStream(databaseFile.FullName, FileMode.Open, FileAccess.Read);
+				using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+				if (file.Length == 0)
+					throw new InvalidDataException("The database file is empty.");
 				Span<byte> header = stackalloc byte[8];
 				int headerRead = file.Read(header);
-				if (headerRead == FormatMagicStreaming.Length && header.SequenceEqual(FormatMagicStreaming)) {
-					DbWrapper = DeserializeDatabaseStreaming(file);
-				}
-				else if (headerRead == FormatMagic.Length && header.SequenceEqual(FormatMagic)) {
-					// A non-empty file that deserializes to null is corrupt, not empty —
-					// throw so the catch below quarantines it instead of silently
-					// replacing the user's database with an empty one (#814).
-					DbWrapper = MemoryPackSerializer.DeserializeAsync<DatabaseWrapper>(file)
+				if (headerRead == FormatMagicStreaming.Length && header.SequenceEqual(FormatMagicStreaming))
+					wrapper = DeserializeDatabaseStreaming(file);
+				else if (headerRead == FormatMagic.Length && header.SequenceEqual(FormatMagic))
+					wrapper = MemoryPackSerializer.DeserializeAsync<DatabaseWrapper>(file)
 						.AsTask().GetAwaiter().GetResult()
 						?? throw new InvalidDataException("Database payload deserialized to null.");
-				}
 				else {
-					// Legacy protobuf-net database (3.x / early 4.x).
 					file.Position = 0;
+					if (file.Length > int.MaxValue)
+						throw new InvalidDataException("The legacy database is too large to load.");
 					byte[] raw = new byte[file.Length];
 					file.ReadExactly(raw);
-					DbWrapper = LegacyDatabaseReader.Read(raw);
-					Logger.Instance.Info("Legacy database format detected — it will be stored in the new format on the next save.");
+					wrapper = LegacyDatabaseReader.Read(raw);
+					Logger.Instance.Info("Legacy database format detected; it will be stored in the new format on the next save.");
 				}
+				if (wrapper.Entries == null)
+					throw new InvalidDataException("The database entry collection is missing.");
+				return true;
 			}
-			catch (Exception ex) {
-				st.Stop();
-				// A broken temp file (e.g. a crash mid-save) must not block startup:
-				// drop it and retry with the real database file.
-				if (databaseFile.FullName == new FileInfo(TempDatabasePath).FullName) {
-					Logger.Instance.Warn($"Importing previously scanned files from '{databaseFile.FullName}' has failed; retrying with the main database file.");
-					try { databaseFile.Delete(); } catch (Exception) { }
-					return LoadDatabase();
-				}
-				Logger.Instance.Error($"Importing previously scanned files has failed because of: {ex}");
-				try {
-					File.Move(databaseFile.FullName, Path.ChangeExtension(databaseFile.FullName, "_DAMAGED.db"), true);
-				}
-				catch (Exception) { }
-				return false;
-			}
+			catch (Exception ex) { error = ex; return false; }
+		}
 
-			st.Stop();
-			Logger.Instance.Info($"Previously scanned files imported. {Database.Count:N0} files in {st.Elapsed}");
+		static void AcceptLoadedDatabase(DatabaseWrapper wrapper, string sourcePath, TimeSpan elapsed) {
+			DbWrapper = wrapper;
 			MigrateImageHashesIfNeeded();
 			HealPoisonedFingerprintsIfNeeded();
-			return true;
+			Logger.Instance.Info($"Scan database loaded from '{sourcePath}': {Database.Count:N0} entries in {elapsed}.");
 		}
+
+		static void LogLoadFailure(string source, string path, Exception? error) =>
+			Logger.Instance.Error($"Loading {source} '{path}' failed: {error?.Message ?? "unknown error"}");
+
+		static void QuarantineDamagedMainDatabase() {
+			if (!File.Exists(CurrentDatabasePath)) return;
+			try {
+				string damagedPath = Path.ChangeExtension(CurrentDatabasePath, "_DAMAGED.db");
+				File.Copy(CurrentDatabasePath, damagedPath, true);
+				Logger.Instance.Info($"Copied the damaged main scan database to '{damagedPath}' for diagnostics.");
+			}
+			catch (Exception ex) { Logger.Instance.Warn($"Could not quarantine damaged main scan database: {ex.Message}"); }
+		}
+
+		static bool RestoreBackupToMain(string backupPath, out Exception? error) {
+			error = null;
+			try {
+				Directory.CreateDirectory(DatabaseFolder);
+				CopyFileDurably(backupPath, RestoreTempPath);
+				File.Move(RestoreTempPath, CurrentDatabasePath, true);
+				return true;
+			}
+			catch (Exception ex) { error = ex; return false; }
+			finally { TryDelete(RestoreTempPath); }
+		}
+
+		static bool PromoteTemporaryDatabase(out Exception? error) {
+			error = null;
+			try {
+				File.Move(TempDatabasePath, CurrentDatabasePath, true);
+				Logger.Instance.Info("Recovered the main scan database from a complete temporary database.");
+				return true;
+			}
+			catch (Exception ex) { error = ex; return false; }
+		}
+
+		static bool DeleteInvalidTemporaryDatabase() {
+			try { File.Delete(TempDatabasePath); return !File.Exists(TempDatabasePath); }
+			catch (Exception ex) {
+				Logger.Instance.Error($"Could not remove invalid temporary scan database '{TempDatabasePath}': {ex.Message}");
+				return false;
+			}
+		}
+
+		internal static bool CreateBackup() {
+			lock (DatabaseIoLock) {
+				if (!File.Exists(CurrentDatabasePath)) return true;
+				try {
+					Directory.CreateDirectory(DatabaseFolder);
+					TryDelete(BackupPath(BackupSlotCount));
+					for (int slot = BackupSlotCount - 1; slot >= 1; slot--) {
+						string source = BackupPath(slot);
+						if (File.Exists(source)) File.Move(source, BackupPath(slot + 1), true);
+					}
+					CopyFileDurably(CurrentDatabasePath, BackupTempPath);
+					File.Move(BackupTempPath, BackupPath(1), true);
+					Logger.Instance.Info($"Created scan database backup '{BackupPath(1)}'.");
+					return true;
+				}
+				catch (Exception ex) { Logger.Instance.Error($"Creating or rotating scan database backups failed: {ex.Message}"); return false; }
+				finally { TryDelete(BackupTempPath); }
+			}
+		}
+
+		static void CopyFileDurably(string sourcePath, string destinationPath) {
+			using var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+			using var destination = new FileStream(destinationPath, FileMode.Create, FileAccess.Write, FileShare.None);
+			source.CopyTo(destination);
+			destination.Flush(flushToDisk: true);
+		}
+
+		static void TryDelete(string path) { try { File.Delete(path); } catch { } }
 
 		// Stopping a scan on builds before the Stop-cancellation fix (fa902d3) could leave entries
 		// "poisoned": AudioFingerprintError set plus an empty fingerprint although the file itself is
@@ -221,19 +346,22 @@ namespace VDF.Core.Utils {
 			SaveDatabase();
 		}
 		internal static void SaveDatabase() {
-			Logger.Instance.Info($"Save scanned files to disk ({Database.Count:N0} files).");
-
-			using (FileStream stream = new(TempDatabasePath, FileMode.Create))
-				SerializeDatabaseStreaming(stream, DbWrapper);
-			//Reason: https://github.com/0x90d/videoduplicatefinder/issues/247
-			File.Move(TempDatabasePath, CurrentDatabasePath, true);
-
-			if (pendingFingerprintHealMarker) {
-				try {
-					File.WriteAllText(FingerprintHealMarkerPath, "Fingerprint error flags were reset once after the Stop-poisoning fix. Delete this file to run the reset again on next load.");
-					pendingFingerprintHealMarker = false;
+			lock (DatabaseIoLock) {
+				Logger.Instance.Info($"Save scanned files to disk ({Database.Count:N0} files).");
+				Directory.CreateDirectory(DatabaseFolder);
+				using (FileStream stream = new(TempDatabasePath, FileMode.Create)) {
+					SerializeDatabaseStreaming(stream, DbWrapper);
+					stream.Flush(flushToDisk: true);
 				}
-				catch (Exception) { }
+				//Reason: https://github.com/0x90d/videoduplicatefinder/issues/247
+				File.Move(TempDatabasePath, CurrentDatabasePath, true);
+				if (pendingFingerprintHealMarker) {
+					try {
+						File.WriteAllText(FingerprintHealMarkerPath, "Fingerprint error flags were reset once after the Stop-poisoning fix. Delete this file to run the reset again on next load.");
+						pendingFingerprintHealMarker = false;
+					}
+					catch (Exception) { }
+				}
 			}
 		}
 

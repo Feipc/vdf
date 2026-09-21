@@ -38,8 +38,11 @@ public class DuplicateItemSerializationTests {
 			Folder = @"C:\media",
 			SizeLong = 12345,
 			Similarity = 98.5f,
+			SimilarityReferencePath = @"C:\media\reference.mp4",
+			IsSimilarityReference = true,
 			Duration = TimeSpan.FromSeconds(61),
 			DateCreated = new DateTime(2026, 6, 11, 12, 0, 0, DateTimeKind.Utc),
+			DateModified = new DateTime(2026, 6, 12, 12, 0, 0, DateTimeKind.Utc),
 			IsImage = false,
 			Format = "h264",
 			AudioFormat = "aac",
@@ -64,8 +67,11 @@ public class DuplicateItemSerializationTests {
 		Assert.Equal(item.Path, restored.Path);
 		Assert.Equal(item.SizeLong, restored.SizeLong);
 		Assert.Equal(item.Similarity, restored.Similarity);
+		Assert.Equal(item.SimilarityReferencePath, restored.SimilarityReferencePath);
+		Assert.Equal(item.IsSimilarityReference, restored.IsSimilarityReference);
 		Assert.Equal(item.Duration, restored.Duration);
 		Assert.Equal(item.DateCreated, restored.DateCreated);
+		Assert.Equal(item.DateModified, restored.DateModified);
 		Assert.Equal(item.Format, restored.Format);
 		Assert.Equal(item.AudioFormat, restored.AudioFormat);
 		Assert.Equal(item.AudioChannel, restored.AudioChannel);

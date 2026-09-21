@@ -26,6 +26,9 @@ In **Settings → Partial Clip Detection**, check **Enable Partial Clip Detectio
 
 | Setting | Default | Description |
 |---------|---------|-------------|
+| Candidate search mode | Fast Balanced | Uses an in-memory audio fingerprint index to reduce exact comparisons. Select Exact when candidate loss is unacceptable. |
+| Maximum source candidates per clip | 256 | Fast Balanced candidate cap after offset voting. |
+| Index memory limit (MiB) | 8192 | Fast Balanced automatically falls back to Exact if the index cannot fit. |
 | Min clip / source ratio (%) | 10 | Minimum clip duration as a percentage of the source duration. Clips shorter than this are ignored. |
 | Min audio similarity (%) | 80 | Minimum average Hamming similarity for the sliding-window fingerprint match to be accepted. |
 | Require visual confirmation | on | Reject audio matches whose frames at the matched offset don't also look similar. |
@@ -172,10 +175,11 @@ vdf-cli scan-and-compare \
 | `--exclude <path>` | Directory to exclude (repeatable) | — |
 | `--threshold <n>` | Hash difference threshold | 5 |
 | `--percent <n>` | Minimum similarity % to report | 96 |
-| `--parallelism <n>` | Parallel hashing threads | 1 |
+| `--parallelism <n>` | Parallel hashing and comparison workers (`-1` = all visible CPUs) | 1 |
 | `--include-images` | Also scan image files | off |
 | `--use-phash` | Use perceptual hashing | off |
 | `--partial-clip-detection` | Enable partial clip detection (audio fingerprinting) | off |
+| `--partial-clip-search-mode fast\|exact` | Approximate indexed search or exhaustive candidate search | fast |
 | `--partial-clip-min-ratio <n>` | Min clip/source duration ratio (0.0–1.0) | 0.10 |
 | `--partial-clip-similarity <n>` | Min audio fingerprint similarity (0.0–1.0) | 0.80 |
 | `--ai-matching` | AI matching pass (downloads components on first use) | off |
@@ -313,7 +317,7 @@ docker run -d \
 
 ### docker compose (recommended for permanent installs)
 
-1. Download [`docker-compose.yml`](docker-compose.yml) from this repository.
+1. Clone or download this source checkout and run the commands from its root directory.
 
 2. Edit the file and add your media volume mounts. Optionally set your own password:
 ```yaml
@@ -324,16 +328,16 @@ volumes:
   - /mnt/nas/series:/mnt/nas/series:ro
 ```
 
-3. Start the service:
+3. Build the optimized Web image from this checkout and start the service:
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 
 4. Open **http://localhost:8080** in your browser and enter the password (check `docker logs` if you didn't set one).
 
-5. To update to the latest image:
+5. After updating the source, rebuild and restart:
 ```bash
-docker compose pull && docker compose up -d
+docker compose build --pull && docker compose up -d
 ```
 
 ### Volume reference
@@ -343,6 +347,68 @@ docker compose pull && docker compose up -d
 | `/root/.config/VDF` | Settings (`web-settings.json`) and login credentials — mount a named volume here so configuration persists across container updates |
 | `/root/.local/state/VDF` | Scan database (`ScannedFiles.db`) — mount a named volume here so hashed-file data persists across container updates |
 | Your media paths | Mount each media directory you want to scan. Read-only (`:ro`) is recommended. |
+
+### Stage worker autotuning
+
+Locally built optimized Web images include the read-only benchmark under
+`/app/bench`. The standard profile evaluates each parallel stage independently
+and writes an importable worker profile:
+
+```bash
+sudo docker run --rm \
+  --entrypoint dotnet \
+  -v /volume7/Datastore1/Videos:/mnt/Videos:ro \
+  -v /volume5/docker/vdf/config:/output \
+  vdf-web:compare-optimized \
+  /app/bench/VDF.Benchmarks.dll \
+  --probe-stage-autotune \
+  --media-dir /mnt/Videos \
+  --preset standard \
+  --thumbnail-count 5 \
+  --output /output/worker-profile.json
+```
+
+Open **Settings → Performance Workers** to import the generated JSON or override
+individual stages manually. A stage value of `0` inherits the global worker
+setting; `-1` uses all CPUs visible to the container.
+
+To measure the Results grouping, similarity filtering, sorting, and 50-group
+page projection with 6,000 synthetic result items:
+
+```bash
+sudo docker run --rm \
+  --entrypoint dotnet \
+  vdf-web:compare-optimized \
+  /app/bench/VDF.Benchmarks.dll \
+  --probe-results 6000
+```
+
+### Persistent Web results
+
+After a successful Web scan, the remaining duplicate list is saved atomically
+to `/root/.local/state/VDF/WebResults.json`. It is restored automatically when
+the container starts, without hashing, comparing, or reading the media files.
+Delete, move, link, and Remove-from-list operations update the snapshot after a
+short debounce. Starting another scan keeps the previous snapshot until the new
+scan completes successfully. Selected result paths and exact-directory
+exclusions are stored with the result list. Thumbnails, search/similarity
+filters, hidden cards, and the current page are not stored.
+
+### Scan database safety and backups
+
+VDF Web loads `ScannedFiles.db` before restoring `WebResults.json`. If the scan
+database cannot be loaded, saved results are not exposed for destructive file
+operations. A required backup is created before each full scan and before every
+delete, move, hardlink, or symlink batch; failure aborts the operation before
+media or result state changes.
+
+Five rolling backups are kept beside the main database, newest first:
+`ScannedFiles.backup-1.db` through `ScannedFiles.backup-5.db`. Normal scan
+checkpoints do not create backups. If the temporary and main databases cannot
+be loaded, startup tries backup slots 1 through 5 and atomically restores the
+first valid backup to `ScannedFiles.db`.
+If a configured custom database directory is missing or not mounted, VDF Web
+fails closed instead of silently falling back to an empty default database.
 
 ### Notes
 
