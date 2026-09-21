@@ -143,97 +143,12 @@ app.MapPost("/auth/login", async (HttpContext ctx, AuthService auth) => {
 	}
 });
 
-// HQ thumbnail endpoint — extracts a fresh frame using configurable resolution and quality.
-// Used by the card-based results view for crisp thumbnails.
-var webSettings = app.Services.GetRequiredService<WebSettingsService>();
-app.MapGet("/thumbnail/hq", async (
-	HttpContext ctx,
-	ScanService scan,
-	ResultThumbnailService thumbnails) => {
-	string? path = ctx.Request.Query["path"];
-	if (string.IsNullOrEmpty(path)) { ctx.Response.StatusCode = 400; return; }
-
-	var item = ResultPresentationUtils.FindResultByPath(
-		scan.Duplicates,
-		path,
-		out string normalizedPath);
-	if (item == null) { ctx.Response.StatusCode = 404; return; }
-	path = normalizedPath;
-	int index = int.TryParse(ctx.Request.Query["index"], out int requestedIndex)
-		? requestedIndex
-		: 0;
-	if (!ThumbnailPositionResolver.TryGetPosition(item, scan.Settings, index, out TimeSpan position)) {
-		ctx.Response.StatusCode = 400;
-		return;
-	}
-
-	// Honor the w/q the page requested (falling back to the current settings) so
-	// cached browser URLs stay consistent with the bytes they were rendered from.
-	int width = int.TryParse(ctx.Request.Query["w"], out int w) ? w : webSettings.ThumbnailWidth;
-	int quality = int.TryParse(ctx.Request.Query["q"], out int q) ? q : webSettings.ThumbnailJpegQuality;
-	width = Math.Clamp(width, 48, 960);
-	quality = Math.Clamp(quality, 10, 95);
-
-	string cacheKey = $"{path}|frame={index}|{position.TotalSeconds:F2}|{width}|{quality}";
-
-	byte[]? jpeg;
-	try {
-		jpeg = await thumbnails.GetOrCreateAsync(
-			cacheKey,
-			() => ScanEngine.ExtractThumbnailJpeg(path, position, width, quality),
-			ctx.RequestAborted);
-	}
-	catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested) {
-		return;
-	}
-	if (jpeg == null || jpeg.Length == 0) {
-		// FFmpeg encodes at the requested quality directly — no re-encode pass needed.
-		await WriteThumbnailPlaceholder(ctx);
-		return;
-	}
-
-	ctx.Response.ContentType = "image/jpeg";
-	ctx.Response.Headers.CacheControl = "public, max-age=3600";
-	await ctx.Response.Body.WriteAsync(jpeg);
-});
-
-// Full-resolution thumbnail endpoint — extracts at original resolution for the comparison modal.
-app.MapGet("/thumbnail/full", async (HttpContext ctx, ScanService scan) => {
-	string? path = ctx.Request.Query["path"];
-	if (string.IsNullOrEmpty(path)) { ctx.Response.StatusCode = 400; return; }
-
-	var item = ResultPresentationUtils.FindResultByPath(
-		scan.Duplicates,
-		path,
-		out string normalizedPath);
-	if (item == null) { ctx.Response.StatusCode = 404; return; }
-	path = normalizedPath;
-	int index = int.TryParse(ctx.Request.Query["index"], out int requestedIndex)
-		? requestedIndex
-		: 0;
-	if (!ThumbnailPositionResolver.TryGetPosition(item, scan.Settings, index, out TimeSpan position)) {
-		ctx.Response.StatusCode = 400;
-		return;
-	}
-
-	string cacheKey = $"{path}|frame={index}|{position.TotalSeconds:F2}|full";
-
-	if (!scan.FullThumbCache.TryGetValue(cacheKey, out var jpeg)) {
-		jpeg = await Task.Run(() => ScanEngine.ExtractThumbnailJpeg(path, position, 0));
-		if (jpeg == null || jpeg.Length == 0) {
-			await WriteThumbnailPlaceholder(ctx);
-			return;
-		}
-		// Full-resolution frames are megabytes each — keep this cache small.
-		if (scan.FullThumbCache.Count >= 64)
-			scan.FullThumbCache.Clear();
-		scan.FullThumbCache.TryAdd(cacheKey, jpeg);
-	}
-
-	ctx.Response.ContentType = "image/jpeg";
-	ctx.Response.Headers.CacheControl = "public, max-age=3600";
-	await ctx.Response.Body.WriteAsync(jpeg);
-});
+// Frame endpoints of the results page: HQ for the cards, full resolution for the
+// comparison modal. Both take the position to show as "t", see ThumbnailEndpoints.
+app.MapGet("/thumbnail/hq", (HttpContext ctx, ScanService scan, WebSettingsService webSettings,
+	ResultThumbnailService thumbnails) => ThumbnailEndpoints.Hq(ctx, scan, webSettings, thumbnails));
+app.MapGet("/thumbnail/full", (HttpContext ctx, ScanService scan) =>
+	ThumbnailEndpoints.Full(ctx, scan));
 
 // CSV export of the current results — same column layout as the GUI export,
 // minus the GUI-only Checked column.
