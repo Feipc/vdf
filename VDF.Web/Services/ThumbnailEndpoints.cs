@@ -29,7 +29,7 @@ namespace VDF.Web.Services {
 		/// Used by the card-based results view for crisp thumbnails.
 		/// </summary>
 		public static async Task Hq(HttpContext ctx, ScanService scan, WebSettingsService webSettings,
-			ResultThumbnailService? thumbnails = null) {
+			ResultThumbnailService thumbnails) {
 			if (!TryFindItem(ctx, scan, out var item)) return;
 
 			// Honor the w/q the page requested (falling back to the current settings) so
@@ -43,24 +43,13 @@ namespace VDF.Web.Services {
 			string cacheKey = $"{item.Path}|{position.TotalSeconds:F2}|{width}|{quality}";
 
 			byte[]? jpeg;
-			if (thumbnails != null) {
-				try {
-					jpeg = await thumbnails.GetOrCreateAsync(cacheKey,
-						() => ScanEngine.ExtractThumbnailJpeg(item.Path, position, width, quality),
-						ctx.RequestAborted);
-				}
-				catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested) {
-					return;
-				}
+			try {
+				jpeg = await thumbnails.GetOrCreateAsync(cacheKey,
+					() => ScanEngine.ExtractThumbnailJpeg(item.Path, position, width, quality),
+					ctx.RequestAborted);
 			}
-			else if (!scan.HqThumbCache.TryGetValue(cacheKey, out jpeg)) {
-				// FFmpeg encodes at the requested quality directly — no re-encode pass needed.
-				jpeg = await Task.Run(() => ScanEngine.ExtractThumbnailJpeg(item.Path, position, width, quality));
-				if (jpeg is { Length: > 0 }) {
-					if (scan.HqThumbCache.Count >= 4096)
-						scan.HqThumbCache.Clear();
-					scan.HqThumbCache.TryAdd(cacheKey, jpeg);
-				}
+			catch (OperationCanceledException) when (ctx.RequestAborted.IsCancellationRequested) {
+				return;
 			}
 			if (jpeg == null || jpeg.Length == 0) { await WritePlaceholder(ctx); return; }
 

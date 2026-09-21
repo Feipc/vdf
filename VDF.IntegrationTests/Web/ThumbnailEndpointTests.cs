@@ -35,6 +35,7 @@ public sealed class ThumbnailEndpointTests : IDisposable {
 	readonly string _settingsPath;
 	readonly ScanService _scan;
 	readonly WebSettingsService _webSettings;
+	readonly ResultThumbnailService _thumbnails = new();
 
 	public ThumbnailEndpointTests(FfmpegFixture fixture) {
 		_fixture = fixture;
@@ -52,6 +53,7 @@ public sealed class ThumbnailEndpointTests : IDisposable {
 
 	public void Dispose() {
 		_scan.Dispose();
+		_thumbnails.Dispose();
 		WebSettingsService.TestOverrideSettingsPath = null;
 		try { File.Delete(_settingsPath); } catch { }
 		_guard.Dispose();
@@ -76,7 +78,7 @@ public sealed class ThumbnailEndpointTests : IDisposable {
 		Get(ctx => ThumbnailEndpoints.Full(ctx, _scan), query);
 
 	Task<(int Status, string? ContentType, byte[] Body)> GetHq(string query) =>
-		Get(ctx => ThumbnailEndpoints.Hq(ctx, _scan, _webSettings), query);
+		Get(ctx => ThumbnailEndpoints.Hq(ctx, _scan, _webSettings, _thumbnails), query);
 
 	static byte[] Frame(string path, double seconds, int width = 0, int quality = 0) =>
 		ScanEngine.ExtractThumbnailJpeg(path, TimeSpan.FromSeconds(seconds), width, quality)!;

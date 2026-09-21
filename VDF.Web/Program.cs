@@ -230,14 +230,3 @@ var ffmpegSetup = app.Services.GetRequiredService<FFmpegSetupService>();
 _ = ffmpegSetup.CheckAndSetupAsync();
 
 app.Run();
-
-static async Task WriteThumbnailPlaceholder(HttpContext ctx) {
-	const string svg =
-		"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"640\" height=\"360\" viewBox=\"0 0 640 360\">" +
-		"<rect width=\"640\" height=\"360\" fill=\"#20242b\"/>" +
-		"<text x=\"320\" y=\"185\" text-anchor=\"middle\" fill=\"#9ca3af\" " +
-		"font-family=\"sans-serif\" font-size=\"24\">No preview</text></svg>";
-	ctx.Response.ContentType = "image/svg+xml";
-	ctx.Response.Headers.CacheControl = "no-store";
-	await ctx.Response.WriteAsync(svg);
-}
