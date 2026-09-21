@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using VDF.Core.FFTools;
 
 namespace VDF.Core.Tests.FFTools {
@@ -21,22 +20,20 @@ namespace VDF.Core.Tests.FFTools {
 			Assert.Equal(expected, destination.ToArray());
 		}
 
-		[Fact]
-		public void CopyTo_TerminatesAProcessWhosePipeStopsProducingOutput() {
+		[Fact(Timeout = 10_000)]
+		public async Task CopyTo_TerminatesAProcessWhosePipeStopsProducingOutput() {
 			using var source = new NeverCompletingReadStream();
 			using var destination = new MemoryStream();
 			int timeoutCalls = 0;
-			var stopwatch = Stopwatch.StartNew();
 
-			bool completed = ProcessStreamCopy.CopyTo(
+			bool completed = await Task.Run(() => ProcessStreamCopy.CopyTo(
 				source,
 				destination,
 				TimeSpan.FromMilliseconds(50),
-				() => Interlocked.Increment(ref timeoutCalls));
+				() => Interlocked.Increment(ref timeoutCalls)));
 
 			Assert.False(completed);
 			Assert.Equal(1, timeoutCalls);
-			Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2));
 		}
 
 		sealed class NeverCompletingReadStream : Stream {

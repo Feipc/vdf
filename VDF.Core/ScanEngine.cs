@@ -40,7 +40,12 @@ namespace VDF.Core {
 			add => progress.Progress += value;
 			remove => progress.Progress -= value;
 		}
+		// Kept as a public compatibility hook for the Web frontend and benchmark probes.
+		// Its stage publishers are optional in builds that do not collect comparison
+		// telemetry, so the compiler cannot observe a raise inside this assembly.
+#pragma warning disable CS0067
 		public event EventHandler<ComparisonProgressChangedEventArgs>? ComparisonProgress;
+#pragma warning restore CS0067
 		public event EventHandler? BuildingHashesDone;
 		public event EventHandler? ScanDone;
 		public event EventHandler? ScanAborted;
