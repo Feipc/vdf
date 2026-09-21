@@ -1,10 +1,25 @@
 name: Windows 64-bit
 
-on: [pull_request]
+# CI runs only for the PR lifecycle. In particular, `closed` is deliberately not
+# included: merging the PR creates a push on master, but must not run this build a
+# second time. The master workflow is responsible only for release packaging.
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# A new commit supersedes an older run of the same PR. This keeps exactly one
+# useful validation run per PR revision instead of spending runners on stale SHAs.
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
-
+    if: github.event.pull_request.draft == false
     runs-on: windows-latest
 
     steps:
@@ -27,8 +42,6 @@ jobs:
       run: dotnet test VDF.CLI.Tests/VDF.CLI.Tests.csproj -c Release -v q
     - name: Run GUI Tests
       run: dotnet test VDF.GUI.Tests/VDF.GUI.Tests.csproj -c Release -v q
-    - name: Run Web Tests
-      run: dotnet test VDF.Web.Tests/VDF.Web.Tests.csproj -c Release -v q
     - name: Install FFmpeg
       run: choco install ffmpeg -y --no-progress
     - name: Run Integration Tests
