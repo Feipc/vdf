@@ -15,9 +15,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
       - name: Log in to Tencent Cloud Registry
         uses: docker/login-action@v4
         with:
@@ -26,19 +23,24 @@ jobs:
           password: ${{ secrets.TCR_PASSWORD }}
 
       - name: Build and push vdf-web
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: VDF.Web/Dockerfile
-          platforms: linux/amd64
-          push: true
-          # TCR expects a runnable Docker image manifest. Buildx provenance/SBOM
-          # attestations wrap even a single-platform build in an OCI image index,
-          # which TCR displays as OCI-Image-List-v1 instead of an image.
-          provenance: false
-          sbom: false
-          tags: |
-            ccr.ccs.tencentyun.com/xarchive/vdf-web:latest
-            ccr.ccs.tencentyun.com/xarchive/vdf-web:${{ github.ref_name }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          IMAGE: ccr.ccs.tencentyun.com/xarchive/vdf-web
+          VERSION: ${{ github.ref_name }}
+        run: |
+          # Build into Docker's local image store, then use `docker push`. Unlike
+          # the Buildx registry exporter, this publishes a Docker schema-2 image
+          # manifest instead of an OCI manifest/index in Tencent Cloud Registry.
+          docker build \
+            --file VDF.Web/Dockerfile \
+            --tag "$IMAGE:latest" \
+            --tag "$IMAGE:$VERSION" \
+            .
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:$VERSION"
+
+          # Do not silently regress to OCI-Image-v1/OCI-Image-List-v1 again.
+          media_type="$(docker manifest inspect "$IMAGE:$VERSION" | jq -r '.mediaType')"
+          test "$media_type" = "application/vnd.docker.distribution.manifest.v2+json" || {
+            echo "Unexpected pushed manifest media type: $media_type" >&2
+            exit 1
+          }
