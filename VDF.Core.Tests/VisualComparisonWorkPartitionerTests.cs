@@ -21,41 +21,22 @@ namespace VDF.Core.Tests {
 		[Fact]
 		public void Create_ExposesOneLogicalBucketToAllConfiguredWorkers() {
 			const int workers = 4;
-			using var firstWorkersReady = new CountdownEvent(workers);
-			int entered = 0;
-			int active = 0;
-			int peakActive = 0;
-
-			Parallel.ForEach(
-				VisualComparisonWorkPartitioner.Create(64),
-				new ParallelOptions { MaxDegreeOfParallelism = workers },
-				_ => {
-					int currentActive = Interlocked.Increment(ref active);
-					UpdateMaximum(ref peakActive, currentActive);
-					try {
-						int ordinal = Interlocked.Increment(ref entered);
-						if (ordinal <= workers) {
-							firstWorkersReady.Signal();
-							Assert.True(firstWorkersReady.Wait(TimeSpan.FromSeconds(5)));
-						}
-						Thread.SpinWait(10_000);
-					}
-					finally {
-						Interlocked.Decrement(ref active);
-					}
-				});
-
-			Assert.Equal(workers, peakActive);
-		}
-
-		static void UpdateMaximum(ref int maximum, int value) {
-			int current;
-			do {
-				current = Volatile.Read(ref maximum);
-				if (current >= value)
-					return;
+			var partitions = VisualComparisonWorkPartitioner.Create(64)
+				.GetOrderablePartitions(workers);
+			try {
+				// Exercise the partitioner contract directly. Waiting for Parallel.ForEach
+				// to schedule four callbacks at the same instant made this test depend on
+				// spare Windows runner threads rather than on the partitioner under test.
+				Assert.Equal(workers, partitions.Count);
+				Assert.All(partitions, partition => Assert.True(partition.MoveNext()));
+				Assert.Equal(
+					workers,
+					partitions.Select(partition => partition.Current.Value).Distinct().Count());
 			}
-			while (Interlocked.CompareExchange(ref maximum, value, current) != current);
+			finally {
+				foreach (var partition in partitions)
+					partition.Dispose();
+			}
 		}
 	}
 }
